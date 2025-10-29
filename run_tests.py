@@ -2,10 +2,29 @@
 """
 run_tests.py
 
-Termux network tester con UI mejorada y altamente responsive.
-Mantiene la funcionalidad: baseline + ping por fase (upload/download), iperf3 TCP,
-recolección RSSI (termux-api), logs, export JSON/CSV, pausa/reanudar/stop, resumen por ubicación,
-y gráficas (Chart.js). Plantilla optimizada para distintos tamaños de pantalla.
+Termux Network Tester — Mobile-first UI
+
+Este archivo contiene la aplicación Flask completa (backend de pruebas y UI)
+con una interfaz adaptada especialmente para móviles: diseño single-column,
+botonera inferior fija (start/pause/resume/stop/export), controles táctiles
+grandes, cambio rápido entre ubicaciones (p1..p8) mediante barra inferior,
+soporte de modo oscuro automático, y charts responsivos.
+
+Funcionalidad del backend:
+- Baseline ping (configurable) + ping por fase (upload/download).
+- iperf3 TCP upload y download (duración total por iteración dividida en mitades).
+- Repeticiones por ubicación (p1..p8), pausa tras una ubicación (a menos que Auto).
+- Recolección de RSSI mediante termux-wifi-connectioninfo.
+- Export JSON y CSV de logs y resumen.
+- Estadísticas: mean, median, p95 y jitter (simple + RFC3550).
+
+Requisitos (Termux):
+- pkg install python iperf3 termux-api
+- pip install Flask
+
+Ejecución:
+python run_tests.py --host 0.0.0.0 --port 5000
+Abrir en el navegador del teléfono: http://localhost:5000
 """
 import os
 import subprocess
@@ -19,6 +38,7 @@ from flask import Flask, request, jsonify, send_file, render_template_string
 
 APP = Flask(__name__)
 
+# ---------- Global state ----------
 state = {
     "running": False,
     "paused": False,
@@ -33,81 +53,86 @@ state = {
 
 LOCATIONS = ["p1","p2","p3","p4","p5","p6","p7","p8"]
 
-# Responsive UI template: improved for many screen sizes and orientations.
+# ---------- Mobile-first UI template ----------
+# Single-column layout, sticky bottom action bar, large touch targets, dark mode support.
 INDEX_HTML = """
 <!doctype html>
 <html lang="es">
 <head>
-<meta charset="utf-8">
+<meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Termux Network Tester — Responsive</title>
-
-<!-- Chart.js CDN -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.3.0/dist/chart.umd.min.js"></script>
-
+<title>Termux Network Tester — Mobile</title>
+<link rel="preconnect" href="https://fonts.gstatic.com">
 <style>
   :root{
-    --bg:#f4f7fb;
-    --card:#ffffff;
-    --muted:#64748b;
-    --accent:#2563eb;
-    --danger:#ef4444;
-    --success:#16a34a;
-    --glass: rgba(255,255,255,0.6);
-    --shadow: 0 10px 30px rgba(2,6,23,0.06);
-    --radius:12px;
+    --bg: #0f172a;
+    --panel: #0b1220;
+    --muted: #94a3b8;
+    --accent: #60a5fa;
+    --accent-2: #7dd3fc;
+    --success: #34d399;
+    --danger: #fb7185;
+    --glass: rgba(255,255,255,0.03);
+    --card-radius: 14px;
+    --gap: 12px;
+    --btn-h: 52px;
     font-family: Inter, Roboto, Arial, sans-serif;
+    color-scheme: dark;
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
   }
+  html,body{margin:0;padding:0;height:100%;background:linear-gradient(180deg,var(--bg),#071029);color:#e6eef8}
+  .app{max-width:900px;margin:0 auto;padding:12px;box-sizing:border-box}
+  header{display:flex;align-items:center;gap:10px;padding-bottom:6px}
+  .logo{width:46px;height:46px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#021028;box-shadow:0 6px 18px rgba(8,10,28,0.6)}
+  h1{font-size:1.05rem;margin:0}
+  .lead{font-size:0.86rem;color:var(--muted);margin-top:2px}
+  main{display:flex;flex-direction:column;gap:var(--gap);padding-bottom:84px} /* leave space for bottom bar */
 
-  html,body { height:100%; margin:0; background:var(--bg); color:#0f172a; }
-  .app { max-width:1100px; margin:0 auto; padding:12px; box-sizing:border-box; }
+  .card{background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));border-radius:var(--card-radius);padding:12px;box-shadow:0 8px 26px rgba(2,6,23,0.45)}
+  .controls .row{display:flex;gap:8px;flex-wrap:wrap}
+  input, select{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:10px 12px;border-radius:10px;color:inherit;font-size:0.95rem;min-width:110px}
+  input[type=number]{-moz-appearance:textfield}
+  label.small{font-size:0.82rem;color:var(--muted)}
+  .controls{display:flex;flex-direction:column;gap:8px}
 
-  header { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
-  .logo { background:linear-gradient(135deg,var(--accent),#60a5fa); color:white; width:48px; height:48px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; box-shadow:var(--shadow); }
-  h1 { font-size:1.05rem; margin:0; }
-  p.lead { margin:0; color:var(--muted); font-size:0.87rem; }
+  /* Big touch buttons */
+  .actions{display:flex;gap:8px;flex-wrap:wrap}
+  button.btn{height:var(--btn-h);border-radius:12px;border:0;padding:0 14px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+  .btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#021028}
+  .btn.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);color:#dbeafe}
+  .btn.warn{background:linear-gradient(90deg,#f97316,#fb7185);color:#071023}
+  .btn.small{height:40px;padding:0 10px;font-weight:600;border-radius:10px}
 
-  main { display:flex; flex-direction:column; gap:12px; }
+  .status{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
+  .pill{background:var(--glass);padding:8px 10px;border-radius:999px;font-weight:700;color:#dbeafe}
 
-  .card { background:var(--card); border-radius:var(--radius); padding:12px; box-shadow:var(--shadow); }
-  form .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  input[type=text], input[type=number], select { padding:10px 12px; border-radius:10px; border:1px solid #e6eef9; background:#fff; font-size:0.95rem; box-sizing:border-box; }
-  input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-  label.small { font-size:0.82rem; color:var(--muted); }
+  /* summary */
+  .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:8px}
+  .s-card{padding:10px;border-radius:10px;background:linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.02)}
+  .s-card h4{margin:0;font-size:0.86rem}
+  .s-val{font-weight:800;font-size:1rem;margin-top:6px}
 
-  .controls { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
-  button.primary { background:var(--accent); color:white; border:none; padding:12px 14px; border-radius:10px; font-weight:700; font-size:0.98rem; min-width:86px; }
-  button.ghost { background:transparent; border:1px solid #e6eef9; padding:10px 12px; border-radius:10px; color:var(--muted); min-width:86px;}
-  button.danger { background:var(--danger); color:white; border:none; padding:10px 12px; border-radius:10px; min-width:86px; }
+  /* charts */
+  .chart { margin-top:8px; border-radius:10px; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.02); padding:8px }
+  canvas{width:100% !important;height:120px !important;display:block}
 
-  /* Responsive grid for summary & charts */
-  .section-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; margin-top:8px; }
-  .s-card { padding:10px; border-radius:10px; background:linear-gradient(180deg,#fff,#fbfdff); border:1px solid #eef6ff; }
-  .s-card h4{ margin:0; font-size:0.9rem; color:#0f172a; }
-  .s-val{ font-size:1rem; font-weight:700; margin-top:6px; color:#03132b; }
+  /* logs */
+  .logbox{font-family:monospace;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;max-height:220px;overflow:auto;color:#cfe7ff}
 
-  .chart-box { background:#fff; border-radius:10px; padding:8px; border:1px solid #eef6ff; box-shadow: 0 6px 18px rgba(2,6,23,0.03); }
-  .chart-title { font-size:0.8rem; color:var(--muted); margin-bottom:6px; }
-  .chart-canvas { width:100%; height:120px; }
+  /* bottom sticky bar for mobile actions */
+  .bottom-bar{position:fixed;left:0;right:0;bottom:0;background:linear-gradient(180deg, rgba(2,6,23,0.9), rgba(2,6,23,0.95));padding:10px 12px;display:flex;align-items:center;gap:8px;justify-content:space-between;box-shadow:0 -8px 30px rgba(2,6,23,0.6)}
+  .bottom-group{display:flex;gap:8px;align-items:center}
+  .loc-list{display:flex;gap:6px;overflow:auto;padding:6px;background:transparent}
+  .loc-btn{min-width:44px;height:44px;border-radius:10px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.02);display:flex;align-items:center;justify-content:center;font-weight:700;color:#dbeafe}
+  .loc-btn.active{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#021028}
 
-  .logbox { max-height:260px; overflow:auto; white-space:pre-wrap; font-family: monospace; font-size:0.85rem; background:#fbfdff; padding:10px; border-radius:8px; color:#0f172a; border:1px solid #eef6ff; }
-
-  .progress { height:8px; background:#e6f0ff; border-radius:999px; overflow:hidden; margin-top:8px; }
-  .progress > i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),#7dd3fc); width:0%; transition:width 600ms linear; }
-
-  .muted { color:var(--muted); font-size:0.85rem; }
-
-  footer { text-align:center; color:var(--muted); font-size:0.82rem; margin-top:8px; padding-bottom:12px; }
-
-  /* Small screens adjustments */
-  @media (max-width:420px) {
-    header { gap:8px; }
-    .logo{ width:44px; height:44px; }
-    .chart-canvas { height:100px; }
-    button.primary { padding:10px 12px; font-size:0.95rem; }
-    .s-card { padding:8px; }
+  /* responsive small screens */
+  @media (max-width:420px){
+    .s-val{font-size:0.95rem}
+    canvas{height:92px !important}
+    .controls .row{flex-direction:column}
+    .loc-btn{min-width:40px;height:40px;font-size:0.86rem}
   }
 </style>
 </head>
@@ -117,341 +142,319 @@ INDEX_HTML = """
     <div class="logo">TN</div>
     <div>
       <h1>Termux Network Tester</h1>
-      <p class="lead">Baseline + ping por fase • p1..p8 • UI responsive</p>
+      <div class="lead">Baseline + ping por fase · p1..p8 · móvil</div>
     </div>
   </header>
 
   <main>
-    <section class="card" id="controlsCard" aria-labelledby="controlsHeading">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-        <strong id="controlsHeading">Controles</strong>
-        <div class="muted" id="statusInfo">idle</div>
+    <section class="card" id="controlsCard" aria-label="Controles de prueba">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>Controles</strong>
+        <div class="pill" id="statusPill">idle</div>
       </div>
 
-      <form id="startForm" style="margin-top:8px;">
+      <div class="controls" style="margin-top:10px">
         <div class="row">
-          <input type="text" name="server" placeholder="Servidor iperf3 (IP o host)" value="192.168.1.1" required aria-label="Servidor iperf3">
-          <select name="iters" title="Iteraciones por ubicación" aria-label="Iteraciones">
+          <input id="serverInput" type="text" name="server" placeholder="Servidor iperf3 (IP)" value="192.168.1.100">
+          <select id="itersSelect" name="iters" aria-label="Iteraciones">
             <option>3</option><option>4</option><option selected>5</option>
           </select>
         </div>
 
-        <div class="row" style="margin-top:8px;">
-          <input type="number" name="duration" min="10" value="60" style="max-width:140px" aria-label="Duración total (s)" title="Duración total por iteración">
-          <input type="number" name="baseline" min="2" max="30" value="8" style="max-width:120px" aria-label="Baseline (s)">
-          <input type="number" step="0.05" name="ping_interval" value="0.2" style="max-width:120px" aria-label="Ping interval">
-          <label class="small" style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="auto" value="1"> Auto</label>
+        <div class="row" style="margin-top:8px">
+          <input id="durationInput" type="number" name="duration" min="10" value="60" placeholder="Duración total (s)" style="max-width:140px">
+          <input id="baselineInput" type="number" name="baseline" min="2" max="30" value="8" placeholder="Baseline (s)" style="max-width:120px">
+          <input id="pingInterval" type="number" step="0.05" name="ping_interval" value="0.2" placeholder="Ping s" style="max-width:120px">
+          <label style="display:flex;align-items:center;gap:6px;color:var(--muted)"><input id="autoChk" type="checkbox" name="auto" value="1"> Auto</label>
         </div>
 
-        <div class="controls">
-          <button class="primary" type="submit" id="startBtn">▶ Iniciar</button>
-          <button class="ghost" type="button" id="pauseBtn">⏸ Pausar</button>
-          <button class="ghost" type="button" id="resumeBtn">⏯ Reanudar</button>
-          <button class="danger" type="button" id="stopBtn">■ Detener</button>
-          <button class="ghost" type="button" id="jsonBtn">⬇ JSON</button>
-          <button class="ghost" type="button" id="csvBtn">⬇ CSV</button>
+        <div class="actions" style="margin-top:6px">
+          <button class="btn primary" id="startBtn">▶ Iniciar</button>
+          <button class="btn ghost" id="pauseBtn">⏸ Pausar</button>
+          <button class="btn ghost" id="resumeBtn">⏯ Reanudar</button>
+          <button class="btn warn" id="stopBtn">■ Detener</button>
+          <button class="btn ghost" id="jsonBtn">⬇ JSON</button>
+          <button class="btn ghost" id="csvBtn">⬇ CSV</button>
         </div>
 
-        <div style="margin-top:10px;">
-          <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i id="progressBar"></i></div>
-          <div class="muted" id="lastMsg" style="margin-top:8px;">(esperando...)</div>
+        <div class="status" style="margin-top:8px">
+          <div style="flex:1">
+            <div class="muted" id="lastMsg">(esperando...)</div>
+          </div>
         </div>
-      </form>
+      </div>
     </section>
 
-    <section class="card" id="summaryCard" aria-labelledby="summaryHeading">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <strong id="summaryHeading">Resumen de ubicación</strong>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <label class="small">Ver: </label>
-          <select id="locationSelect" aria-label="Seleccionar ubicación" style="padding:8px 10px;border-radius:8px;border:1px solid #eef6ff;">
-            <option value="">(actual/última)</option>
-            <option value="p1">p1</option><option value="p2">p2</option><option value="p3">p3</option><option value="p4">p4</option>
-            <option value="p5">p5</option><option value="p6">p6</option><option value="p7">p7</option><option value="p8">p8</option>
-          </select>
+    <section class="card" id="summaryCard" aria-label="Resumen">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>Resumen de ubicación</strong>
+        <div class="muted" id="summaryLoc">—</div>
+      </div>
+
+      <div class="summary-grid">
+        <div class="s-card"><h4>Ping baseline</h4><div class="s-val" id="sb_baseline">—</div><div class="muted">mean / median / p95</div></div>
+        <div class="s-card"><h4>Ping upload</h4><div class="s-val" id="sb_up">—</div><div class="muted">mean / median / p95</div></div>
+        <div class="s-card"><h4>Ping download</h4><div class="s-val" id="sb_down">—</div><div class="muted">mean / median / p95</div></div>
+        <div class="s-card"><h4>Throughput</h4><div class="s-val" id="sb_thr">—</div><div class="muted">upload / download (mean)</div></div>
+      </div>
+
+      <div class="chart" id="charts">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div style="flex:1;min-width:180px">
+            <div class="chart-title muted">Baseline RTT (ms)</div>
+            <canvas id="chartBaseline"></canvas>
+          </div>
+          <div style="flex:1;min-width:180px">
+            <div class="chart-title muted">RTT upload / download (ms)</div>
+            <canvas id="chartRTT"></canvas>
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <div class="chart-title muted">Throughput (Mbps)</div>
+          <canvas id="chartThroughput"></canvas>
         </div>
       </div>
 
-      <div class="section-grid">
-        <div class="s-card">
-          <h4>Ping baseline</h4>
-          <div class="s-val" id="sb_baseline">—</div>
-          <div class="muted">mean / median / p95</div>
-        </div>
-        <div class="s-card">
-          <h4>Ping upload</h4>
-          <div class="s-val" id="sb_up">—</div>
-          <div class="muted">mean / median / p95</div>
-        </div>
-        <div class="s-card">
-          <h4>Ping download</h4>
-          <div class="s-val" id="sb_down">—</div>
-          <div class="muted">mean / median / p95</div>
-        </div>
-        <div class="s-card">
-          <h4>Throughput (Mbps)</h4>
-          <div class="s-val" id="sb_thr">—</div>
-          <div class="muted">upload / download (mean)</div>
-        </div>
-      </div>
-
-      <div class="section-grid" style="margin-top:10px;">
-        <div class="chart-box" aria-hidden="false">
-          <div class="chart-title">Baseline RTT (ms)</div>
-          <canvas id="chartBaseline" class="chart-canvas" role="img" aria-label="Gráfica de baseline RTT"></canvas>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">RTT: upload vs download (ms)</div>
-          <canvas id="chartRTT" class="chart-canvas" role="img" aria-label="Gráfica de RTT upload vs download"></canvas>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">Throughput (Mbps)</div>
-          <canvas id="chartThroughput" class="chart-canvas" role="img" aria-label="Gráfica de throughput"></canvas>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">Últimos logs (resumen)</div>
-          <div id="miniLog" style="font-family:monospace; font-size:0.82rem; color:#0f172a; margin-top:6px;"></div>
-        </div>
-      </div>
-
-      <div id="summaryTable" style="margin-top:10px;"></div>
+      <div style="margin-top:10px" id="summaryTable"></div>
     </section>
 
-    <section class="card">
+    <section class="card" id="logsCard" aria-label="Logs">
       <strong>Logs recientes</strong>
-      <div class="logbox" id="logbox">(no hay logs)</div>
+      <div class="logbox" id="logbox">(no hay logs todavía)</div>
     </section>
-
-    <footer class="muted">Ejecuta en Termux y abre http://localhost:5000 — interfaz optimizada para móviles</footer>
   </main>
 </div>
 
+<!-- bottom bar: locations + quick actions -->
+<div class="bottom-bar" role="toolbar" aria-label="Acciones rápidas">
+  <div class="loc-list" id="locList" aria-hidden="false">
+    <!-- location buttons injected by JS -->
+  </div>
+  <div class="bottom-group">
+    <button class="btn small ghost" id="prevLoc">◀</button>
+    <button class="btn small ghost" id="nextLoc">▶</button>
+  </div>
+</div>
+
+<!-- Chart.js (lightweight) via CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-/* ---------- Helpers ---------- */
-const el = id => document.getElementById(id);
-const LOCS = ["p1","p2","p3","p4","p5","p6","p7","p8"];
+/* ---------- Client JS (mobile-first) ---------- */
+const LOCS = %s;
 let charts = { baseline:null, rtt:null, thr:null };
-let chartInited = false;
-let lastConfig = null;
+let selectedLoc = null;
 
-/* debounce utility */
-function debounce(fn, wait){
-  let t;
-  return function(...args){ clearTimeout(t); t = setTimeout(()=>fn.apply(this,args), wait); };
-}
+/* helpers */
+const $ = id => document.getElementById(id);
 
-/* Chart creation (responsive) */
-function createCharts(){
-  if(chartInited) return;
-  const baselineCtx = el('chartBaseline').getContext('2d');
-  charts.baseline = new Chart(baselineCtx, {
-    type: 'line',
-    data: { labels: [], datasets: [{ label:'baseline', data: [], borderColor:'#2563eb', backgroundColor:'rgba(37,99,235,0.08)', tension:0.35, pointRadius:0 }] },
-    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{beginAtZero:false, ticks:{maxTicksLimit:4}}} }
-  });
-
-  const rttCtx = el('chartRTT').getContext('2d');
-  charts.rtt = new Chart(rttCtx, {
-    type: 'line',
-    data: { labels: [], datasets: [
-      { label:'upload', data: [], borderColor:'#16a34a', backgroundColor:'rgba(16,163,82,0.06)', tension:0.35, pointRadius:0 },
-      { label:'download', data: [], borderColor:'#ef4444', backgroundColor:'rgba(239,68,68,0.06)', tension:0.35, pointRadius:0 }
-    ]},
-    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}, scales:{x:{display:false}, y:{beginAtZero:false, ticks:{maxTicksLimit:4}}} }
-  });
-
-  const thrCtx = el('chartThroughput').getContext('2d');
-  charts.thr = new Chart(thrCtx, {
-    type: 'line',
-    data: { labels: [], datasets: [
-      { label:'upload Mbps', data: [], borderColor:'#7c3aed', backgroundColor:'rgba(124,58,237,0.06)', tension:0.35, pointRadius:0 },
-      { label:'download Mbps', data: [], borderColor:'#ea580c', backgroundColor:'rgba(234,88,12,0.06)', tension:0.35, pointRadius:0 }
-    ]},
-    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}, scales:{x:{display:false}, y:{beginAtZero:true, ticks:{maxTicksLimit:4}}} }
-  });
-
-  chartInited = true;
-}
-
-/* Set chart data from history object */
-function setChartData(history){
-  createCharts();
-  if(!history) {
-    // clear charts
-    ['baseline','rtt','thr'].forEach(k=>{
-      if(charts[k]){
-        charts[k].data.labels = [];
-        charts[k].data.datasets.forEach(ds => ds.data = []);
-        charts[k].update();
-      }
+function initLocButtons(){
+  const container = $('locList');
+  container.innerHTML = '';
+  LOCS.forEach((l, idx) => {
+    const b = document.createElement('button');
+    b.className = 'loc-btn';
+    b.innerText = l.toUpperCase();
+    b.dataset.loc = l;
+    b.addEventListener('click', ()=> {
+      selectLocation(l);
     });
+    container.appendChild(b);
+  });
+}
+
+function setActiveLocButton(loc){
+  selectedLoc = loc;
+  const btns = document.querySelectorAll('.loc-btn');
+  btns.forEach(b => {
+    if(b.dataset.loc === loc) b.classList.add('active');
+    else b.classList.remove('active');
+  });
+}
+
+/* create charts */
+function createCharts(){
+  if(charts.baseline) return;
+  const ctxB = $('chartBaseline').getContext('2d');
+  charts.baseline = new Chart(ctxB, { type:'line',
+    data:{ labels:[], datasets:[{label:'baseline', data:[], borderColor:'#60a5fa', backgroundColor:'rgba(96,165,250,0.08)', tension:0.3, pointRadius:0}]},
+    options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{ticks:{maxTicksLimit:4}}}}
+  });
+  const ctxR = $('chartRTT').getContext('2d');
+  charts.rtt = new Chart(ctxR, { type:'line',
+    data:{ labels:[], datasets:[
+      {label:'upload', data:[], borderColor:'#34d399', backgroundColor:'rgba(52,211,153,0.06)', tension:0.3, pointRadius:0},
+      {label:'download', data:[], borderColor:'#fb7185', backgroundColor:'rgba(251,113,133,0.06)', tension:0.3, pointRadius:0}
+    ]},
+    options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}, scales:{x:{display:false}, y:{ticks:{maxTicksLimit:4}}}}
+  });
+  const ctxT = $('chartThroughput').getContext('2d');
+  charts.thr = new Chart(ctxT, { type:'line',
+    data:{ labels:[], datasets:[
+      {label:'upload Mbps', data:[], borderColor:'#a78bfa', backgroundColor:'rgba(167,139,250,0.06)', tension:0.3, pointRadius:0},
+      {label:'download Mbps', data:[], borderColor:'#fb923c', backgroundColor:'rgba(251,146,60,0.06)', tension:0.3, pointRadius:0}
+    ]},
+    options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}, scales:{x:{display:false}, y:{beginAtZero:true,ticks:{maxTicksLimit:4}}}}
+  });
+}
+
+function updateCharts(history){
+  createCharts();
+  if(!history || !history.iterations || history.iterations.length===0){
+    // clear
+    for(let k in charts){
+      charts[k].data.labels = [];
+      charts[k].data.datasets.forEach(ds=>ds.data = []);
+      charts[k].update();
+    }
     return;
   }
-  const labels = history.iterations.map(i => `#${i}`);
+  const labels = history.iterations.map(i=>'#'+i);
   charts.baseline.data.labels = labels;
-  charts.baseline.data.datasets[0].data = history.baseline_mean.map(v => v === null ? NaN : v);
+  charts.baseline.data.datasets[0].data = history.baseline_mean.map(v => v===null?NaN:v);
   charts.baseline.update();
 
   charts.rtt.data.labels = labels;
-  charts.rtt.data.datasets[0].data = history.up_mean.map(v => v === null ? NaN : v);
-  charts.rtt.data.datasets[1].data = history.down_mean.map(v => v === null ? NaN : v);
+  charts.rtt.data.datasets[0].data = history.up_mean.map(v => v===null?NaN:v);
+  charts.rtt.data.datasets[1].data = history.down_mean.map(v => v===null?NaN:v);
   charts.rtt.update();
 
   charts.thr.data.labels = labels;
-  charts.thr.data.datasets[0].data = history.upload_mbps.map(v => v === null ? NaN : v);
-  charts.thr.data.datasets[1].data = history.download_mbps.map(v => v === null ? NaN : v);
+  charts.thr.data.datasets[0].data = history.upload_mbps.map(v => v===null?NaN:v);
+  charts.thr.data.datasets[1].data = history.download_mbps.map(v => v===null?NaN:v);
   charts.thr.update();
 }
 
-/* ---------- UI Actions ---------- */
-
-document.getElementById('startForm').addEventListener('submit', function(e){
-  e.preventDefault();
-  const form = new FormData(e.target);
-  fetch('/start', { method: 'POST', body: form }).then(r=>r.json()).then(j=>{
-    if(j.error) alert('Error: ' + j.error); else { updateStatus(); }
-  }).catch(err=>alert('Error: ' + err));
-});
-
-el('pauseBtn').addEventListener('click', ()=> fetch('/pause',{method:'POST'}).then(()=>updateStatus()));
-el('resumeBtn').addEventListener('click', ()=> fetch('/resume',{method:'POST'}).then(()=>updateStatus()));
-el('stopBtn').addEventListener('click', ()=> fetch('/stop',{method:'POST'}).then(()=>updateStatus()));
-el('jsonBtn').addEventListener('click', ()=> window.location='/download/json');
-el('csvBtn').addEventListener('click', ()=> window.location='/download/csv');
-
-el('locationSelect').addEventListener('change', function(){
-  // if user selects an explicit location, ask backend for that location's history via /status (it will show last completed summary/hist if current == selected)
-  updateStatus();
-});
-
-/* Progress update */
-function updateProgress(pct){ el('progressBar').style.width = pct + '%'; }
-
-/* Build summary table small */
-function buildSmallTable(summary) {
-  if(!summary) return '<div class="muted">Sin resumen todavía</div>';
-  const up = summary.ping_upload_mean_stats || {};
-  const down = summary.ping_download_mean_stats || {};
-  const base = summary.ping_baseline_mean_stats || {};
-  const upThr = summary.upload_stats_mbps || {};
-  const downThr = summary.download_stats_mbps || {};
-  return `<table class="small" style="width:100%;border-collapse:collapse;margin-top:8px;"><tr><th style="text-align:left;padding:6px">Métrica</th><th style="padding:6px">mean</th><th style="padding:6px">median</th><th style="padding:6px">p95</th></tr>
-    <tr><td style="padding:6px">Baseline RTT</td><td style="padding:6px">${base.mean||'—'}</td><td style="padding:6px">${base.median||'—'}</td><td style="padding:6px">${base.p95||'—'}</td></tr>
-    <tr><td style="padding:6px">Upload RTT</td><td style="padding:6px">${up.mean||'—'}</td><td style="padding:6px">${up.median||'—'}</td><td style="padding:6px">${up.p95||'—'}</td></tr>
-    <tr><td style="padding:6px">Download RTT</td><td style="padding:6px">${down.mean||'—'}</td><td style="padding:6px">${down.median||'—'}</td><td style="padding:6px">${down.p95||'—'}</td></tr>
-    <tr><td style="padding:6px">Upload Mbps</td><td style="padding:6px">${upThr.mean||'—'}</td><td style="padding:6px">${upThr.median||'—'}</td><td style="padding:6px">${upThr.p95||'—'}</td></tr>
-    <tr><td style="padding:6px">Download Mbps</td><td style="padding:6px">${downThr.mean||'—'}</td><td style="padding:6px">${downThr.median||'—'}</td><td style="padding:6px">${downThr.p95||'—'}</td></tr>
-  </table>`;
+/* UI set values */
+function setSummary(locSummary, loc){
+  $('summaryLoc').innerText = loc || '—';
+  const base = (locSummary && locSummary.ping_baseline_mean_stats) || {};
+  const up = (locSummary && locSummary.ping_upload_mean_stats) || {};
+  const down = (locSummary && locSummary.ping_download_mean_stats) || {};
+  const upThr = (locSummary && locSummary.upload_stats_mbps) || {};
+  $('sb_baseline').innerText = (base.mean!==undefined) ? `${base.mean} / ${base.median} / ${base.p95}` : '—';
+  $('sb_up').innerText = (up.mean!==undefined) ? `${up.mean} / ${up.median} / ${up.p95}` : '—';
+  $('sb_down').innerText = (down.mean!==undefined) ? `${down.mean} / ${down.median} / ${down.p95}` : '—';
+  $('sb_thr').innerText = ((upThr.mean!==undefined)||( (upThr.mean||downThr.mean) )) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
 }
 
-/* Fetch status and render UI; supports selecting explicit location */
+/* fetch status and render */
 async function updateStatus(){
-  try {
+  try{
     const res = await fetch('/status');
-    const j = await res.json();
-    const running = j.running;
-    const curLoc = j.current_location || '';
-    el('statusInfo').innerText = running ? `▶ ${curLoc} · iter ${j.current_iteration}` : 'idle';
-    el('lastMsg').innerText = j.last_message || '';
+    const data = await res.json();
+    $('statusPill').innerText = data.running ? ('▶ ' + (data.current_location||'') + ' · iter ' + (data.current_iteration||0)) : 'idle';
+    $('lastMsg').innerText = data.last_message || '(esperando...)';
 
-    // recent logs
-    const logs = j.logs || [];
-    if(logs.length===0) {
-      el('logbox').innerText = '(no hay logs)';
-      el('miniLog').innerText = '';
-    } else {
-      const lastEntries = logs.slice(-6).reverse();
+    // logs
+    const logs = data.logs || [];
+    if(logs.length===0) $('logbox').innerText = '(no hay logs todavía)';
+    else {
       let txt = '';
-      lastEntries.forEach(it => {
+      logs.slice(-6).reverse().forEach(it => {
         txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
         txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
       });
-      el('logbox').innerText = txt;
-      el('miniLog').innerText = txt.split('\\n').slice(0,6).join('\\n');
+      $('logbox').innerText = txt;
     }
 
-    // determine which location to show in summary: user selected or current/last
-    const sel = el('locationSelect').value;
-    let locToShow = sel || curLoc;
-    let locSummary = null;
-    let history = null;
-    if (locToShow) {
-      locSummary = (j.summary || {})[locToShow] || null;
-      // if the UI's current location equals locToShow and backend returned history, use it; otherwise build history from logs
-      if (locToShow === curLoc && j.current_location_history) {
-        history = j.current_location_history;
-      } else {
-        // try to build history client-side from j.logs
-        const items = (j.logs || []).filter(it => it.location === locToShow);
-        if (items.length) {
-          const iterations = items.map(it => it.iteration);
-          const baseline_mean = items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null);
-          const up_mean = items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null);
-          const down_mean = items.map(it => (it.ping_stats_download||{}).mean_ms ?? null);
-          const upload_mbps = items.map(it => it.upload_mbps ?? null);
-          const download_mbps = items.map(it => it.download_mbps ?? null);
-          history = { iterations, baseline_mean, up_mean, down_mean, upload_mbps, download_mbps };
-        }
+    // which location to show (user selection has priority)
+    const userSel = document.getElementById('locList').querySelector('.loc-btn.active');
+    let viewLoc = userSel ? userSel.dataset.loc : data.current_location;
+    if(!viewLoc){
+      // fallback to last summary key
+      const keys = Object.keys(data.summary || {});
+      if(keys.length) viewLoc = keys[keys.length-1];
+    }
+    // summary and history
+    const locSummary = (data.summary||{})[viewLoc] || data.current_location_summary || null;
+    setSummary(locSummary, viewLoc);
+    // use backend history when viewing current location, else try to build from logs
+    let history = data.current_location_history || null;
+    if(!history && viewLoc){
+      const items = (data.logs || []).filter(it => it.location === viewLoc);
+      if(items.length){
+        history = {
+          iterations: items.map(it=>it.iteration),
+          baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null),
+          up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null),
+          down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null),
+          upload_mbps: items.map(it => it.upload_mbps ?? null),
+          download_mbps: items.map(it => it.download_mbps ?? null),
+        };
       }
-    } else {
-      // no location selected: show j.current_location_summary or last summary
-      locSummary = j.current_location_summary || null;
-      history = j.current_location_history || null;
     }
+    updateCharts(history);
 
-    // update summary cards
-    const base = (locSummary && locSummary.ping_baseline_mean_stats) || {};
-    const up = (locSummary && locSummary.ping_upload_mean_stats) || {};
-    const down = (locSummary && locSummary.ping_download_mean_stats) || {};
-    const upThr = (locSummary && locSummary.upload_stats_mbps) || {};
-    const downThr = (locSummary && locSummary.download_stats_mbps) || {};
-    el('sb_baseline').innerText = (base.mean!==undefined) ? `${base.mean} / ${base.median} / ${base.p95}` : '—';
-    el('sb_up').innerText = (up.mean!==undefined) ? `${up.mean} / ${up.median} / ${up.p95}` : '—';
-    el('sb_down').innerText = (down.mean!==undefined) ? `${down.mean} / ${down.median} / ${down.p95}` : '—';
-    el('sb_thr').innerText = ((upThr.mean!==undefined) || (downThr.mean!==undefined)) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
-    el('summaryTable').innerHTML = buildSmallTable(locSummary);
-
-    // charts from history (either backend-provided or client-made)
-    setChartData(history);
-
-    // progress: roughly based on number of iterations finished across locations
-    if (j.config && j.config.iters_per_loc) {
-      const iters = j.config.iters_per_loc;
-      const idx = j.current_location ? (LOCS.indexOf(j.current_location) + 1) : 0;
-      const totalSteps = LOCS.length * iters;
-      const done = ((idx-1) * iters) + (j.current_iteration || 0);
-      const pct = totalSteps > 0 ? Math.min(100, Math.round((done/totalSteps)*100)) : 0;
-      updateProgress(pct);
+    // progress approximation
+    if(data.config && data.config.iters_per_loc){
+      const iters = data.config.iters_per_loc;
+      const idx = data.current_location ? (LOCS.indexOf(data.current_location) + 1) : 0;
+      const total = LOCS.length * iters;
+      const done = ((idx-1) * iters) + (data.current_iteration || 0);
+      const pct = total > 0 ? Math.min(100, Math.round((done/total)*100)) : 0;
+      document.querySelector('.bottom-bar .progress')?.style && (document.querySelector('.bottom-bar .progress').style.width = pct + '%');
     }
-    lastConfig = j.config || lastConfig;
-  } catch (err) {
-    console.error('status update failed', err);
+  }catch(e){
+    console.error('updateStatus failed', e);
   }
 }
 
-/* Initialize charts on first paint and handle resize (debounced) */
-window.addEventListener('load', () => {
-  createCharts();
-  updateStatus();
-  // responsive: trigger chart resize on orientation or resize
-  const resizeHandler = debounce(() => {
-    Object.values(charts).forEach(c => { try { c.resize(); } catch(e){} });
-  }, 250);
-  window.addEventListener('resize', resizeHandler);
-  window.addEventListener('orientationchange', resizeHandler);
+/* Actions */
+$('startBtn').addEventListener('click', async ()=>{
+  const form = new FormData();
+  form.append('server', $('serverInput').value);
+  form.append('iters', $('itersSelect').value);
+  form.append('duration', $('durationInput').value);
+  form.append('baseline', $('baselineInput').value);
+  form.append('ping_interval', $('pingInterval').value);
+  form.append('auto', $('autoChk').checked ? '1' : '');
+  await fetch('/start', { method:'POST', body:form }).then(r=>r.json()).then(j => {
+    if(j.error) alert('Error: '+j.error);
+    updateStatus();
+  }).catch(e=>alert('start error: '+e));
 });
 
-/* Polling */
-setInterval(updateStatus, 1500);
+$('pauseBtn').addEventListener('click', ()=> fetch('/pause',{method:'POST'}).then(()=>updateStatus()));
+$('resumeBtn').addEventListener('click', ()=> fetch('/resume',{method:'POST'}).then(()=>updateStatus()));
+$('stopBtn').addEventListener('click', ()=> fetch('/stop',{method:'POST'}).then(()=>updateStatus()));
+$('jsonBtn').addEventListener('click', ()=> location.href='/download/json');
+$('csvBtn').addEventListener('click', ()=> location.href='/download/csv');
+
+$('prevLoc').addEventListener('click', ()=>{
+  const btns = Array.from(document.querySelectorAll('.loc-btn'));
+  const idx = btns.findIndex(b => b.classList.contains('active'));
+  const next = idx > 0 ? btns[idx-1] : btns[btns.length-1];
+  next.click();
+});
+$('nextLoc').addEventListener('click', ()=>{
+  const btns = Array.from(document.querySelectorAll('.loc-btn'));
+  const idx = btns.findIndex(b => b.classList.contains('active'));
+  const next = (idx < btns.length-1) ? btns[idx+1] : btns[0];
+  next.click();
+});
+
+function selectLocation(l){
+  setActiveLocButton(l);
+  updateStatus();
+}
+
+/* initialize */
+window.addEventListener('load', ()=>{
+  initLocButtons();
+  // default select first location
+  setActiveLocButton('p1');
+  createCharts();
+  updateStatus();
+  setInterval(updateStatus, 1500);
+  // make charts responsive on orientation
+  window.addEventListener('orientationchange', ()=> { for(let k in charts) charts[k]?.resize(); });
+});
 </script>
 </body>
 </html>
-"""
+""" % (json.dumps(LOCATIONS))
 
-# --- Backend logic (same as before) ---
-# For brevity, backend measurement and logging functions remain unchanged and identical
-# to the previous fully-featured script. They are included here in full to make this file
-# self-contained and runnable in Termux.
+# ---------- Backend functions (same measurement logic used before) ----------
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
@@ -492,12 +495,13 @@ def get_rssi():
 
 def run_ping_collect(host, duration_s=60, interval=0.2):
     rtts = []
-    cmd = ['ping', '-i', str(interval), '-w', str(int(duration_s)), host]
+    cmd = ['ping', '-4', '-i', str(interval), '-w', str(int(duration_s)), host]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     except Exception:
+        # fallback to count based if -w not supported
         count = max(2, int(duration_s / interval))
-        cmd = ['ping', '-i', str(interval), '-c', str(count), host]
+        cmd = ['ping', '-4', '-i', str(interval), '-c', str(count), host]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     start = time.time()
@@ -780,6 +784,8 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
         state['current_location_idx'] = 0
         state['current_iteration'] = 0
 
+# ---------- Flask routes ----------
+
 @APP.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -815,7 +821,7 @@ def start():
     auto = request.form.get('auto') == '1'
     t = threading.Thread(target=runner_thread, args=(server, iters, duration_total, ping_interval, baseline_s, auto), daemon=True)
     t.start()
-    return jsonify({"message":"started", "server": server, "iters": iters, "duration_total": duration_total, "baseline_s": baseline_s, "note": "baseline + phase pings enabled"})
+    return jsonify({"message":"started", "server": server, "iters": iters, "duration_total": duration_total, "baseline_s": baseline_s})
 
 @APP.route('/pause', methods=['POST'])
 def pause():
@@ -843,8 +849,7 @@ def stop():
 def status():
     cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
     current_summary = state['summary'].get(cur_loc) if cur_loc else None
-
-    # Build history arrays for current location (for charts)
+    # history for charts (current location)
     history = None
     if cur_loc:
         items = [x for x in state['logs'] if x['location'] == cur_loc]
@@ -863,7 +868,6 @@ def status():
                 "upload_mbps": upload_mbps,
                 "download_mbps": download_mbps
             }
-
     return jsonify({
         "running": state['running'],
         "paused": state['paused'],
@@ -918,7 +922,6 @@ def download_csv():
                 "location": it.get('location'),
                 "iteration": it.get('iteration'),
                 "rssi": it.get('rssi'),
-
                 "baseline_seconds": it.get('baseline_seconds'),
                 "ping_baseline_count": ps_base.get('count',0),
                 "ping_baseline_mean_ms": ps_base.get('mean_ms'),
@@ -926,7 +929,6 @@ def download_csv():
                 "ping_baseline_p95_ms": ps_base.get('p95_ms'),
                 "ping_baseline_jitter_rfc3550_ms": ps_base.get('jitter_rfc3550_ms'),
                 "ping_baseline_jitter_simple_mean_ms": js_base.get('mean_ms'),
-
                 "upload_seconds": it.get('upload_seconds'),
                 "ping_upload_count": ps_up.get('count',0),
                 "ping_upload_mean_ms": ps_up.get('mean_ms'),
@@ -934,7 +936,6 @@ def download_csv():
                 "ping_upload_p95_ms": ps_up.get('p95_ms'),
                 "ping_upload_jitter_rfc3550_ms": ps_up.get('jitter_rfc3550_ms'),
                 "ping_upload_jitter_simple_mean_ms": js_up.get('mean_ms'),
-
                 "download_seconds": it.get('download_seconds'),
                 "ping_download_count": ps_down.get('count',0),
                 "ping_download_mean_ms": ps_down.get('mean_ms'),
@@ -942,15 +943,15 @@ def download_csv():
                 "ping_download_p95_ms": ps_down.get('p95_ms'),
                 "ping_download_jitter_rfc3550_ms": ps_down.get('jitter_rfc3550_ms'),
                 "ping_download_jitter_simple_mean_ms": js_down.get('mean_ms'),
-
                 "download_mbps": it.get('download_mbps'),
                 "upload_mbps": it.get('upload_mbps')
             })
     return send_file(fn, as_attachment=True)
 
+# ---------- Run app ----------
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Termux network tester (responsive UI)')
+    parser = argparse.ArgumentParser(description='Termux network tester — mobile UI')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', default=5000, type=int)
     args = parser.parse_args()
