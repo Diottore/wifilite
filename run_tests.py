@@ -2,35 +2,9 @@
 """
 run_tests.py
 
-Flask web app + runner to perform iperf3/ping/RSSI tests on Termux (no root).
-
-Behavior (phase-separated ping + baseline):
-- Each iteration is a TOTAL duration (e.g. 60s) split in two phases:
-    upload_seconds = duration_total // 2
-    download_seconds = duration_total - upload_seconds
-- For each iteration:
-    1) collect RSSI
-    2) run a short baseline ping WITHOUT tráfico (ping_samples_baseline_ms) for baseline_s seconds (default 8s)
-    3) run ping concurrently during the UPLOAD phase (ping_samples_upload_ms)
-       while iperf3 upload runs for upload_seconds
-    4) run ping concurrently during the DOWNLOAD phase (ping_samples_download_ms)
-       while iperf3 download (-R) runs for download_seconds
-- Ping samples and stats are saved separately for baseline, upload and download phases.
-- Jitter is calculated from ping samples using both:
-    - simple |RTT_i - RTT_{i-1}| stats (mean/median/p95)
-    - RFC3550 estimator (jitter_rfc3550_ms)
-- At the end of each location an aggregate summary (mean/median/p95) is computed and shown
-  in the web UI under "Resumen de ubicación".
-- Exposes a minimal web GUI to control start/pause/resume/stop and to download JSON/CSV.
-- Default ping interval is 0.2 s (configurable in UI). Default baseline is 8s.
-
-Requirements (Termux):
-- pkg install python iperf3 termux-api
-- pip install Flask
-
-Run:
-  python run_tests.py --host 0.0.0.0 --port 5000
-  Open http://localhost:5000 on the phone or http://<phone-ip>:5000 from another device.
+Versión con UI mejorada y adaptada a mobile.
+Mantiene la funcionalidad: baseline + ping por fase (upload/download), iperf3 TCP,
+recolección RSSI (termux-api), logs, export JSON/CSV, pausa/reanudar/stop, resumen por ubicación.
 """
 import os
 import subprocess
@@ -60,112 +34,250 @@ LOCATIONS = ["p1","p2","p3","p4","p5","p6","p7","p8"]
 
 INDEX_HTML = """
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Termux Network Tester (baseline + phases)</title>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Termux Network Tester</title>
 <style>
-  body{font-family:Arial;margin:20px}
-  .log{white-space:pre-wrap;background:#f8f8f8;padding:10px;border-radius:6px;max-height:300px;overflow:auto}
-  .summary { background:#eef; padding:10px; border-radius:6px; margin-top:10px; }
-  .small { font-size:0.9em; color:#333; }
-  table { border-collapse: collapse; width:100%; margin-top:8px; }
-  th, td { border:1px solid #ddd; padding:6px; text-align:left; }
+  :root{
+    --bg:#f6f8fb;
+    --card:#ffffff;
+    --muted:#6b7280;
+    --accent:#2b6ef6;
+    --danger:#e53935;
+    --success:#16a34a;
+    --glass: rgba(255,255,255,0.6);
+    --shadow: 0 6px 20px rgba(16,24,40,0.08);
+    font-family: Inter, Roboto, Arial, sans-serif;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);-webkit-font-smoothing:antialiased}
+  .app { max-width:900px; margin:0 auto; padding:14px; }
+  header{ display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+  .logo { background:linear-gradient(135deg,var(--accent),#6ea8ff); color:white; width:46px; height:46px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; box-shadow:var(--shadow); }
+  h1{ font-size:1.1rem; margin:0; }
+  p.lead{ margin:0; color:var(--muted); font-size:0.9rem; }
+
+  main { display:flex; flex-direction:column; gap:12px; }
+
+  .card { background:var(--card); border-radius:12px; padding:12px; box-shadow:var(--shadow); }
+  form .row { display:flex; gap:8px; flex-wrap:wrap; }
+  form label{ font-size:0.8rem; color:var(--muted); }
+  input[type=text], input[type=number], select { padding:10px 12px; border-radius:8px; border:1px solid #e6e9ef; flex:1; min-width:120px; font-size:0.95rem; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  button.primary { background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; font-weight:600; font-size:0.95rem; }
+  button.ghost { background:transparent; border:1px solid #e6e9ef; padding:10px 12px; border-radius:10px; color:var(--muted); }
+  button.danger { background:var(--danger); color:white; border:none; padding:10px 12px; border-radius:10px; }
+
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  @media (max-width:600px) { .grid { grid-template-columns:1fr; } header h1{ font-size:1rem } }
+
+  .status-row { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .pill { background:var(--glass); padding:8px 10px; border-radius:999px; font-weight:600; color:#0f172a; display:inline-flex; gap:8px; align-items:center; box-shadow: 0 2px 8px rgba(15,23,42,0.04); }
+  .lastmsg { color:var(--muted); font-size:0.85rem; margin-top:6px; }
+
+  .summary-cards { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  .s-card { flex:1 1 48%; background:linear-gradient(180deg, rgba(255,255,255,0.98), var(--card)); padding:10px; border-radius:10px; min-width:140px; }
+  .s-card h4{ margin:0 0 6px 0; font-size:0.9rem; }
+  .s-val{ font-size:1.1rem; font-weight:700; color:#0f172a; }
+  .muted { color:var(--muted); font-size:0.85rem; }
+
+  .logbox { max-height:240px; overflow:auto; white-space:pre-wrap; font-family: monospace; font-size:0.8rem; background:#0f172a0a; padding:10px; border-radius:8px; color:#0f172a; }
+
+  .progress { height:8px; background:#e6eefc; border-radius:999px; overflow:hidden; }
+  .progress > i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),#7dd3fc); width:0%; transition:width 600ms linear; }
+
+  footer { text-align:center; color:var(--muted); font-size:0.85rem; margin-top:8px; }
+
+  /* small table for details */
+  table.small { width:100%; border-collapse:collapse; margin-top:8px; }
+  table.small th, table.small td { text-align:left; padding:6px; border-bottom:1px solid #f1f5f9; font-size:0.9rem; }
 </style>
 </head>
 <body>
-<h2>Termux Network Tester — Baseline + Ping por fase (upload / download)</h2>
+<div class="app">
+  <header>
+    <div class="logo">TN</div>
+    <div>
+      <h1>Termux Network Tester</h1>
+      <p class="lead">Baseline + ping por fase • p1..p8 • mobile-friendly</p>
+    </div>
+  </header>
 
-<form id="startForm">
-Server iperf3: <input name="server" value="192.168.1.1" required>
-Iteraciones por ubicación: <select name="iters"><option>3</option><option>4</option><option selected>5</option></select>
-Duración TOTAL por iteración (s): <input name="duration" type="number" value="60" min="10">
-Baseline (s) antes de cada iteración: <input name="baseline" type="number" value="8" min="2" max="30">
-Ping interval (s): <input name="ping_interval" type="number" step="0.05" value="0.2" min="0.05">
-Auto-advance: <input type="checkbox" name="auto" value="1">
-<button type="submit">Iniciar</button>
-</form>
+  <main>
+    <section class="card" id="controlsCard">
+      <form id="startForm">
+        <div class="row">
+          <input type="text" name="server" placeholder="Servidor iperf3 (IP o host)" value="192.168.1.1" required>
+          <select name="iters" title="Iteraciones por ubicación">
+            <option>3</option><option>4</option><option selected>5</option>
+          </select>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <input type="number" name="duration" min="10" value="60" style="max-width:160px" placeholder="Duración total (s)">
+          <input type="number" name="baseline" min="2" max="30" value="8" style="max-width:140px" placeholder="Baseline s">
+          <input type="number" step="0.05" name="ping_interval" value="0.2" style="max-width:120px" placeholder="Ping s">
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="auto" value="1"> Auto</label>
+        </div>
 
-<p class="small">Flujo por iteración: baseline (sin carga) → upload (ping + iperf upload) → download (ping + iperf download).</p>
+        <div class="controls" style="margin-top:10px;">
+          <button class="primary" type="submit">▶ Iniciar</button>
+          <button class="ghost" type="button" id="pauseBtn">⏸ Pausar</button>
+          <button class="ghost" type="button" id="resumeBtn">⏯ Reanudar</button>
+          <button class="danger" type="button" id="stopBtn">■ Detener</button>
+          <button class="ghost" type="button" id="jsonBtn">⬇ JSON</button>
+          <button class="ghost" type="button" id="csvBtn">⬇ CSV</button>
+        </div>
 
-<button onclick="fetch('/pause',{method:'POST'}).then(()=>refresh())">Pausar</button>
-<button onclick="fetch('/resume',{method:'POST'}).then(()=>refresh())">Reanudar</button>
-<button onclick="fetch('/stop',{method:'POST'}).then(()=>refresh())">Detener</button>
-<button onclick="location.href='/download/json'">Descargar JSON</button>
-<button onclick="location.href='/download/csv'">Descargar CSV</button>
+        <div class="status-row" style="margin-top:12px;">
+          <div class="pill" id="statusPill">idle</div>
+          <div style="flex:1;margin-left:10px;">
+            <div class="progress" aria-hidden="true"><i id="progressBar"></i></div>
+          </div>
+        </div>
+        <div class="lastmsg" id="lastMsg">(esperando...)</div>
+      </form>
+    </section>
 
-<div style="margin-top:12px;">
-  <strong>Estado:</strong> <span id="status">idle</span>
-  &nbsp;&nbsp; <strong>Último mensaje:</strong> <span id="lastmsg"></span>
+    <section class="card" id="summaryCard">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>Resumen de ubicación</strong>
+        <small class="muted" id="summaryLoc">—</small>
+      </div>
+      <div class="summary-cards" id="summaryCards">
+        <div class="s-card">
+          <h4>Ping baseline (mean)</h4>
+          <div class="s-val" id="sb_baseline">—</div>
+          <div class="muted">mean / median / p95</div>
+        </div>
+        <div class="s-card">
+          <h4>Ping upload (mean)</h4>
+          <div class="s-val" id="sb_up">—</div>
+          <div class="muted">mean / median / p95</div>
+        </div>
+        <div class="s-card">
+          <h4>Ping download (mean)</h4>
+          <div class="s-val" id="sb_down">—</div>
+          <div class="muted">mean / median / p95</div>
+        </div>
+        <div class="s-card">
+          <h4>Throughput (Mbps)</h4>
+          <div class="s-val" id="sb_thr">—</div>
+          <div class="muted">upload / download (mean)</div>
+        </div>
+      </div>
+      <div id="summaryTable" style="margin-top:8px;"></div>
+    </section>
+
+    <section class="card">
+      <strong>Logs recientes</strong>
+      <div class="logbox" id="logbox">(no hay logs)</div>
+      <table class="small" id="lastEntries" style="display:none"></table>
+    </section>
+
+    <footer class="muted">Hecho para Termux — ejecuta en el teléfono y abre localhost:5000</footer>
+  </main>
 </div>
 
-<h3>Resumen de ubicación (última finalizada / actual)</h3>
-<div id="summary" class="summary">(sin resumen todavía)</div>
-
-<h3>Logs recientes</h3>
-<div class="log" id="logbox">(esperando...)</div>
-
 <script>
-document.getElementById('startForm').onsubmit = function(e){
+const toFixed = (v, d=3) => (v===undefined || v===null) ? '—' : (Math.round(v*Math.pow(10,d))/Math.pow(10,d));
+const el = id => document.getElementById(id);
+
+document.getElementById('startForm').addEventListener('submit', function(e){
   e.preventDefault();
-  fetch('/start', {method:'POST', body: new FormData(e.target)}).then(r=>r.json()).then(j=>{ alert(j.message || JSON.stringify(j)); refresh(); });
-};
+  const form = new FormData(e.target);
+  fetch('/start', { method: 'POST', body: form }).then(r=>r.json()).then(j=>{
+    if(j.error) alert('Error: ' + j.error); else { updateStatus(); }
+  }).catch(err=>alert('Error: ' + err));
+});
 
-function buildStatsTable(stats) {
-  if(!stats || Object.keys(stats).length===0) return '<div>(no hay datos)</div>';
-  return '<table><tr><th>métrica</th><th>valor</th></tr>' +
-    '<tr><td>mean</td><td>' + (stats.mean!==undefined ? stats.mean : '-') + '</td></tr>' +
-    '<tr><td>median</td><td>' + (stats.median!==undefined ? stats.median : '-') + '</td></tr>' +
-    '<tr><td>p95</td><td>' + (stats.p95!==undefined ? stats.p95 : '-') + '</td></tr>' +
-    '<tr><td>min</td><td>' + (stats.min!==undefined ? stats.min : '-') + '</td></tr>' +
-    '<tr><td>max</td><td>' + (stats.max!==undefined ? stats.max : '-') + '</td></tr>' +
-    '<tr><td>count</td><td>' + (stats.count!==undefined ? stats.count : '-') + '</td></tr>' +
-    '</table>';
+el('pauseBtn').addEventListener('click', ()=> fetch('/pause',{method:'POST'}).then(()=>updateStatus()));
+el('resumeBtn').addEventListener('click', ()=> fetch('/resume',{method:'POST'}).then(()=>updateStatus()));
+el('stopBtn').addEventListener('click', ()=> fetch('/stop',{method:'POST'}).then(()=>updateStatus()));
+el('jsonBtn').addEventListener('click', ()=> window.location='/download/json');
+el('csvBtn').addEventListener('click', ()=> window.location='/download/csv');
+
+function buildSmallTable(summary) {
+  if(!summary) return '<div class="muted">Sin resumen todavía</div>';
+  const up = summary.ping_upload_mean_stats || {};
+  const down = summary.ping_download_mean_stats || {};
+  const base = summary.ping_baseline_mean_stats || {};
+  const upThr = summary.upload_stats_mbps || {};
+  const downThr = summary.download_stats_mbps || {};
+  return `<table class="small">
+    <tr><th>Métrica</th><th>mean</th><th>median</th><th>p95</th></tr>
+    <tr><td>Baseline RTT</td><td>${base.mean||'—'}</td><td>${base.median||'—'}</td><td>${base.p95||'—'}</td></tr>
+    <tr><td>Upload RTT</td><td>${up.mean||'—'}</td><td>${up.median||'—'}</td><td>${up.p95||'—'}</td></tr>
+    <tr><td>Download RTT</td><td>${down.mean||'—'}</td><td>${down.median||'—'}</td><td>${down.p95||'—'}</td></tr>
+    <tr><td>Upload Mbps</td><td>${upThr.mean||'—'}</td><td>${upThr.median||'—'}</td><td>${upThr.p95||'—'}</td></tr>
+    <tr><td>Download Mbps</td><td>${downThr.mean||'—'}</td><td>${downThr.median||'—'}</td><td>${downThr.p95||'—'}</td></tr>
+  </table>`;
 }
 
-function buildSummaryHTML(current_loc, summary) {
-  if(!summary) return '<div>(no hay resumen para la ubicación ' + (current_loc||'') + ')</div>';
-  var html = '<strong>Ubicación:</strong> ' + (current_loc||'N/A') + '<br/>';
-  html += '<div style="margin-top:8px"><strong>Ping (baseline) — estadísticas</strong>' + buildStatsTable(summary.ping_baseline_mean_stats) + '</div>';
-  html += '<div style="margin-top:8px"><strong>Ping (upload) — estadísticas</strong>' + buildStatsTable(summary.ping_upload_mean_stats) + '</div>';
-  html += '<div style="margin-top:8px"><strong>Ping (download) — estadísticas</strong>' + buildStatsTable(summary.ping_download_mean_stats) + '</div>';
-  html += '<div style="margin-top:8px"><strong>Throughput upload —</strong>' + buildStatsTable(summary.upload_stats_mbps) + '</div>';
-  html += '<div style="margin-top:8px"><strong>Throughput download —</strong>' + buildStatsTable(summary.download_stats_mbps) + '</div>';
-  return html;
+function updateProgress(pct){
+  el('progressBar').style.width = pct + '%';
 }
 
-function refresh(){
+function updateStatus(){
   fetch('/status').then(r=>r.json()).then(j=>{
-    document.getElementById('status').innerText = j.running ? ((j.current_location || 'N/A') + ' iter ' + j.current_iteration) : 'idle';
-    document.getElementById('lastmsg').innerText = j.last_message || '';
-    var logs = j.logs || [];
-    if(logs.length===0) document.getElementById('logbox').innerText='(no logs)';
-    else {
-      var txt='';
-      for(var i=0;i<Math.min(30,logs.length);i++) txt += JSON.stringify(logs[logs.length-1-i]) + "\\n\\n";
-      document.getElementById('logbox').innerText = txt;
-    }
-    var current_loc = j.current_location;
-    var loc_summary = null;
-    if (current_loc && j.summary && j.summary[current_loc]) {
-      loc_summary = j.summary[current_loc];
+    const running = j.running;
+    const curLoc = j.current_location || '';
+    el('statusPill').innerText = running ? `▶ ${curLoc} · iter ${j.current_iteration}` : 'idle';
+    el('lastMsg').innerText = j.last_message || '';
+    // logs
+    const logs = j.logs || [];
+    if(logs.length===0) {
+      el('logbox').innerText = '(no hay logs)';
     } else {
-      if (j.summary) {
-        var keys = Object.keys(j.summary);
-        if (keys.length>0) {
-          var last = keys[keys.length-1];
-          loc_summary = j.summary[last];
-          current_loc = last;
-        }
-      }
+      const last = logs.slice(-6).reverse();
+      let txt = '';
+      last.forEach(it => {
+        txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
+        txt += `  baseline mean:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up mean:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn mean:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
+      });
+      el('logbox').innerText = txt;
     }
-    document.getElementById('summary').innerHTML = buildSummaryHTML(current_loc, loc_summary);
-  }).catch(err=>console.error(err));
+    // summary for current or last
+    let locSummary = null;
+    if (j.summary && curLoc && j.summary[curLoc]) locSummary = j.summary[curLoc];
+    else {
+      const keys = Object.keys(j.summary || {});
+      if(keys.length>0) locSummary = j.summary[keys[keys.length-1]];
+    }
+    el('summaryLoc').innerText = (curLoc || (locSummary ? Object.keys(j.summary).slice(-1)[0] : '—')) ;
+    // set cards
+    const base = (locSummary && locSummary.ping_baseline_mean_stats) || {};
+    const up = (locSummary && locSummary.ping_upload_mean_stats) || {};
+    const down = (locSummary && locSummary.ping_download_mean_stats) || {};
+    const upThr = (locSummary && locSummary.upload_stats_mbps) || {};
+    const downThr = (locSummary && locSummary.download_stats_mbps) || {};
+    el('sb_baseline').innerText = (base.mean!==undefined) ? `${base.mean} / ${base.median} / ${base.p95}` : '—';
+    el('sb_up').innerText = (up.mean!==undefined) ? `${up.mean} / ${up.median} / ${up.p95}` : '—';
+    el('sb_down').innerText = (down.mean!==undefined) ? `${down.mean} / ${down.median} / ${down.p95}` : '—';
+    el('sb_thr').innerText = ((upThr.mean!==undefined) || (downThr.mean!==undefined)) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
+    el('summaryTable').innerHTML = buildSmallTable(locSummary);
+    // simple progress: if running, show progress based on current_iteration vs total (if config exists)
+    if (j.config && j.config.iters_per_loc) {
+      const iters = j.config.iters_per_loc;
+      const idx = j.current_location ? (['p1','p2','p3','p4','p5','p6','p7','p8'].indexOf(j.current_location) + 1) : 0;
+      const totalSteps = 8 * iters;
+      const done = ((idx-1) * iters) + (j.current_iteration || 0);
+      const pct = Math.min(100, Math.round((done/totalSteps)*100));
+      updateProgress(pct);
+    }
+  }).catch(err=>{
+    console.error(err);
+  });
 }
-setInterval(refresh,1500);
-refresh();
+
+setInterval(updateStatus, 1500);
+updateStatus();
 </script>
 </body>
 </html>
 """
+
+# --- backend logic (same as previous, unchanged) ---
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
@@ -205,7 +317,6 @@ def get_rssi():
     return None
 
 def run_ping_collect(host, duration_s=60, interval=0.2):
-    """Run ping and collect RTT samples in ms. interval in seconds (e.g., 0.2)."""
     rtts = []
     cmd = ['ping', '-i', str(interval), '-w', str(int(duration_s)), host]
     try:
@@ -375,7 +486,6 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
     try:
         duration_total = int(duration_total)
         baseline_s = max(2, int(baseline_s))
-        # split durations (handle odd durations)
         up_dur = duration_total // 2
         down_dur = duration_total - up_dur
 
@@ -413,16 +523,14 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 rssi = get_rssi()
                 log(f"[{loc}][iter {it}] RSSI: {rssi}")
 
-                # --- BASELINE PHASE (no iperf traffic) ---
+                # baseline
                 ping_baseline_results = []
                 log(f"[{loc}][iter {it}] Running baseline ping for {baseline_s}s (no load)")
                 ping_baseline_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=baseline_s, interval=ping_interval)), args=(ping_baseline_results,))
                 ping_baseline_thread.start()
-                # Wait baseline to finish
                 ping_baseline_thread.join(timeout=baseline_s + 3)
                 if ping_baseline_thread.is_alive():
                     try:
-                        # best effort to stop
                         ping_baseline_thread.join(timeout=1)
                     except:
                         pass
@@ -430,7 +538,7 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 ping_stats_baseline = compute_ping_stats(ping_baseline)
                 log(f"[{loc}][iter {it}] baseline ping count={ping_stats_baseline.get('count',0)} mean={ping_stats_baseline.get('mean_ms')}ms jitter_rfc={ping_stats_baseline.get('jitter_rfc3550_ms')}ms")
 
-                # --- UPLOAD PHASE: ping during upload ---
+                # upload phase
                 ping_up_results = []
                 ping_up_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=up_dur, interval=ping_interval)), args=(ping_up_results,))
                 ping_up_thread.start()
@@ -438,11 +546,10 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 iperf_up = run_iperf3(server, duration=up_dur, reverse=False)
                 upload_mbps = parse_iperf_throughput(iperf_up)
                 log(f"[{loc}][iter {it}] upload Mbps: {upload_mbps}")
-                # ensure ping upload finished
                 if ping_up_thread.is_alive():
                     ping_up_thread.join(timeout=3)
 
-                # --- DOWNLOAD PHASE: ping during download ---
+                # download phase
                 ping_down_results = []
                 ping_down_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=down_dur, interval=ping_interval)), args=(ping_down_results,))
                 ping_down_thread.start()
@@ -453,7 +560,6 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 if ping_down_thread.is_alive():
                     ping_down_thread.join(timeout=3)
 
-                # Compute ping stats per phase
                 rtts_up = ping_up_results if isinstance(ping_up_results, list) else []
                 rtts_down = ping_down_results if isinstance(ping_down_results, list) else []
                 ping_stats_up = compute_ping_stats(rtts_up)
@@ -461,7 +567,6 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 log(f"[{loc}][iter {it}] ping(up) count={ping_stats_up.get('count',0)} mean={ping_stats_up.get('mean_ms')}ms jitter_rfc={ping_stats_up.get('jitter_rfc3550_ms')}ms")
                 log(f"[{loc}][iter {it}] ping(down) count={ping_stats_down.get('count',0)} mean={ping_stats_down.get('mean_ms')}ms jitter_rfc={ping_stats_down.get('jitter_rfc3550_ms')}ms")
 
-                # Save detailed log entry
                 entry = {
                     "timestamp": timestamp,
                     "location": loc,
@@ -483,10 +588,8 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 }
                 state['logs'].append(entry)
 
-            # compute aggregates for location and expose them to UI
             state['summary'][loc] = compute_aggregates_for_location(loc)
             log(f"Finished location {loc}. aggregates updated.")
-            # pause after finishing the location (unless auto)
             if not auto_advance:
                 state['paused'] = True
                 log(f"Paused after {loc}. Press Reanudar to continue.")
@@ -651,7 +754,7 @@ def download_csv():
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Termux network tester (baseline + ping per phase upload/download) with UI summary')
+    parser = argparse.ArgumentParser(description='Termux network tester (mobile UI)')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', default=5000, type=int)
     args = parser.parse_args()
