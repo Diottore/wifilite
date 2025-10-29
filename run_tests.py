@@ -2,29 +2,14 @@
 """
 run_tests.py
 
-Termux Network Tester — Mobile-first UI
+Termux Network Tester — Mobile-first UI (archivo completo)
 
-Este archivo contiene la aplicación Flask completa (backend de pruebas y UI)
-con una interfaz adaptada especialmente para móviles: diseño single-column,
-botonera inferior fija (start/pause/resume/stop/export), controles táctiles
-grandes, cambio rápido entre ubicaciones (p1..p8) mediante barra inferior,
-soporte de modo oscuro automático, y charts responsivos.
-
-Funcionalidad del backend:
-- Baseline ping (configurable) + ping por fase (upload/download).
-- iperf3 TCP upload y download (duración total por iteración dividida en mitades).
-- Repeticiones por ubicación (p1..p8), pausa tras una ubicación (a menos que Auto).
-- Recolección de RSSI mediante termux-wifi-connectioninfo.
-- Export JSON y CSV de logs y resumen.
-- Estadísticas: mean, median, p95 y jitter (simple + RFC3550).
-
-Requisitos (Termux):
-- pkg install python iperf3 termux-api
-- pip install Flask
-
-Ejecución:
-python run_tests.py --host 0.0.0.0 --port 5000
-Abrir en el navegador del teléfono: http://localhost:5000
+- Interfaz móvil responsive (single-column, barra inferior táctil, charts).
+- Baseline ping + ping por fase (upload/download) dividido por iteración.
+- Forzado a IPv4 para ping (-4).
+- Guarda logs detallados y exporta JSON/CSV.
+- Pausa después de cada ubicación a menos que Active "Auto".
+- Reemplazo seguro del marcador @@LOCATIONS@@ para evitar problemas con '%' en la plantilla.
 """
 import os
 import subprocess
@@ -54,7 +39,7 @@ state = {
 LOCATIONS = ["p1","p2","p3","p4","p5","p6","p7","p8"]
 
 # ---------- Mobile-first UI template ----------
-# Single-column layout, sticky bottom action bar, large touch targets, dark mode support.
+# Uses @@LOCATIONS@@ marker that will be replaced safely below.
 INDEX_HTML = """
 <!doctype html>
 <html lang="es">
@@ -240,7 +225,7 @@ INDEX_HTML = """
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 /* ---------- Client JS (mobile-first) ---------- */
-const LOCS = %s;
+const LOCS = @@LOCATIONS@@;
 let charts = { baseline:null, rtt:null, thr:null };
 let selectedLoc = null;
 
@@ -331,10 +316,11 @@ function setSummary(locSummary, loc){
   const up = (locSummary && locSummary.ping_upload_mean_stats) || {};
   const down = (locSummary && locSummary.ping_download_mean_stats) || {};
   const upThr = (locSummary && locSummary.upload_stats_mbps) || {};
+  const downThr = (locSummary && locSummary.download_stats_mbps) || {};
   $('sb_baseline').innerText = (base.mean!==undefined) ? `${base.mean} / ${base.median} / ${base.p95}` : '—';
   $('sb_up').innerText = (up.mean!==undefined) ? `${up.mean} / ${up.median} / ${up.p95}` : '—';
   $('sb_down').innerText = (down.mean!==undefined) ? `${down.mean} / ${down.median} / ${down.p95}` : '—';
-  $('sb_thr').innerText = ((upThr.mean!==undefined)||( (upThr.mean||downThr.mean) )) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
+  $('sb_thr').innerText = ((upThr.mean!==undefined)||(downThr.mean!==undefined)) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
 }
 
 /* fetch status and render */
@@ -385,15 +371,7 @@ async function updateStatus(){
     }
     updateCharts(history);
 
-    // progress approximation
-    if(data.config && data.config.iters_per_loc){
-      const iters = data.config.iters_per_loc;
-      const idx = data.current_location ? (LOCS.indexOf(data.current_location) + 1) : 0;
-      const total = LOCS.length * iters;
-      const done = ((idx-1) * iters) + (data.current_iteration || 0);
-      const pct = total > 0 ? Math.min(100, Math.round((done/total)*100)) : 0;
-      document.querySelector('.bottom-bar .progress')?.style && (document.querySelector('.bottom-bar .progress').style.width = pct + '%');
-    }
+    // progress approximation (not shown visually here, reserved for future)
   }catch(e){
     console.error('updateStatus failed', e);
   }
@@ -442,7 +420,7 @@ function selectLocation(l){
 window.addEventListener('load', ()=>{
   initLocButtons();
   // default select first location
-  setActiveLocButton('p1');
+  setActiveLocButton(LOCS[0] || '');
   createCharts();
   updateStatus();
   setInterval(updateStatus, 1500);
@@ -452,9 +430,12 @@ window.addEventListener('load', ()=>{
 </script>
 </body>
 </html>
-""" % (json.dumps(LOCATIONS))
+"""
 
-# ---------- Backend functions (same measurement logic used before) ----------
+# Safely replace marker with JSON list of locations
+INDEX_HTML = INDEX_HTML.replace('@@LOCATIONS@@', json.dumps(LOCATIONS))
+
+# ---------- Backend functions (measurement logic) ----------
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
@@ -494,12 +475,15 @@ def get_rssi():
     return None
 
 def run_ping_collect(host, duration_s=60, interval=0.2):
+    """
+    Run ping and collect RTT samples in ms. For safety force IPv4 (-4).
+    Uses -w deadline when available, otherwise falls back to -c count.
+    """
     rtts = []
     cmd = ['ping', '-4', '-i', str(interval), '-w', str(int(duration_s)), host]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     except Exception:
-        # fallback to count based if -w not supported
         count = max(2, int(duration_s / interval))
         cmd = ['ping', '-4', '-i', str(interval), '-c', str(count), host]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -785,7 +769,6 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
         state['current_iteration'] = 0
 
 # ---------- Flask routes ----------
-
 @APP.route('/')
 def index():
     return render_template_string(INDEX_HTML)
