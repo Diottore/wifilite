@@ -2,20 +2,18 @@
 """
 run_tests.py
 
-Termux Network Tester — Mobile-first UI with live-updating charts
+Termux Network Tester — Live charts with Server-Sent Events (SSE)
 
-Changes in this version (requested):
-- Charts update more constantly during an ongoing measurement (not only when logs are flushed).
-- Implemented live sample streaming from the ping threads into shared state['live'] lists.
-- /status now returns current live-sample summaries so the frontend can show incremental updates.
-- Frontend polling for status is slightly faster for more responsive charts.
-- Thread-safe access to shared state via state_lock.
+This version adds a /stream SSE endpoint that pushes live updates (live ping samples,
+current history, status) to the browser. The frontend uses EventSource to receive
+these events and updates charts immediately (every ~500 ms) for a smooth live view.
 
-Usage:
-- Save as run_tests.py in Termux
-- Install requirements: pkg install python iperf3 termux-api; pip install Flask
-- Run: python run_tests.py --host 0.0.0.0 --port 5000
-- Open in the phone browser: http://localhost:5000
+Keep all previous functionality: baseline + ping per phase, iperf3, logs, CSV/JSON,
+clear per-location/all, mobile-friendly UI. SSE is added in addition to the /status polling
+(for compatibility/fallback); the frontend prefers SSE when available.
+
+Save as run_tests.py, run:
+  python run_tests.py --host 0.0.0.0 --port 5000
 """
 import os
 import subprocess
@@ -25,7 +23,7 @@ import json
 import csv
 from datetime import datetime
 from statistics import mean, median
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, request, jsonify, send_file, render_template_string, Response, stream_with_context
 
 APP = Flask(__name__)
 
@@ -55,15 +53,15 @@ state_lock = threading.Lock()
 
 LOCATIONS = ["p1","p2","p3","p4","p5","p6","p7","p8"]
 
-# ---------- Mobile-first UI template ----------
-# Uses @@LOCATIONS@@ marker that will be replaced safely below.
+# ---------- UI template (mobile friendly) ----------
+# Marker @@LOCATIONS@@ replaced with JSON below.
 INDEX_HTML = """
 <!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Termux Network Tester — Live Charts</title>
+<title>Termux Network Tester — Live (SSE)</title>
 <style>
   :root{
     --bg: #0f172a;
@@ -71,16 +69,16 @@ INDEX_HTML = """
     --accent: #60a5fa;
     --accent-2: #7dd3fc;
     --glass: rgba(255,255,255,0.03);
-    --card-radius: 14px;
+    --card-radius: 12px;
     --gap: 12px;
-    --btn-h: 52px;
+    --btn-h: 48px;
     font-family: Inter, Roboto, Arial, sans-serif;
     color-scheme: dark;
   }
   html,body{margin:0;padding:0;height:100%;background:linear-gradient(180deg,var(--bg),#071029);color:#e6eef8}
   .app{max-width:900px;margin:0 auto;padding:12px;box-sizing:border-box}
   header{display:flex;align-items:center;gap:10px;padding-bottom:6px}
-  .logo{width:46px;height:46px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#021028}
+  .logo{width:44px;height:44px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#021028}
   h1{font-size:1.05rem;margin:0}
   .lead{font-size:0.86rem;color:var(--muted);margin-top:2px}
   main{display:flex;flex-direction:column;gap:var(--gap);padding-bottom:84px}
@@ -95,7 +93,7 @@ INDEX_HTML = """
   .btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#021028}
   .btn.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);color:#dbeafe}
   .btn.warn{background:linear-gradient(90deg,#f97316,#fb7185);color:#071023}
-  .btn.small{height:40px;padding:0 10px;font-weight:600;border-radius:10px}
+  .btn.small{height:36px;padding:0 10px;font-weight:600;border-radius:10px}
 
   .pill{background:var(--glass);padding:8px 10px;border-radius:999px;font-weight:700;color:#dbeafe}
 
@@ -127,7 +125,7 @@ INDEX_HTML = """
     <div class="logo">TN</div>
     <div>
       <h1>Termux Network Tester</h1>
-      <div class="lead">Baseline + ping por fase · p1..p8 · móvil</div>
+      <div class="lead">Baseline + ping por fase · p1..p8 · live</div>
     </div>
   </header>
 
@@ -222,7 +220,7 @@ INDEX_HTML = """
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-/* Client-side: faster polling and live sample merge for charts */
+/* Client-side: use SSE for live updates; fallback to polling if SSE unsupported */
 const LOCS = @@LOCATIONS@@;
 let charts = { baseline:null, rtt:null, thr:null };
 
@@ -253,10 +251,9 @@ function createCharts(){
   charts.thr = new Chart($('chartThroughput').getContext('2d'), { type:'line', data:{ labels:[], datasets:[{label:'upload Mbps', data:[], borderColor:'#a78bfa'},{label:'download Mbps', data:[], borderColor:'#fb923c'}]}, options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}}});
 }
 
-/* Merge: take backend history arrays and append current live means as an extra point */
+/* Merge: append current live means to history as a temporary last point for live feeling */
 function mergeHistoryWithLive(history, live) {
   if(!history) return null;
-  // copy arrays
   const iters = history.iterations.slice();
   const base = history.baseline_mean.slice();
   const up = history.up_mean.slice();
@@ -264,31 +261,24 @@ function mergeHistoryWithLive(history, live) {
   const upThr = history.upload_mbps.slice();
   const downThr = history.download_mbps.slice();
 
-  // If there's live samples for current iteration, append a synthetic point using means
-  if(live) {
-    // only append if iteration matches next index or replace last point if same iteration
+  if(live && live.iteration !== null && live.iteration !== undefined) {
     const liveIter = live.iteration;
-    if(liveIter !== undefined && liveIter !== null) {
-      const liveBaseMean = (live.baseline && live.baseline.length) ? (live.baseline.reduce((a,b)=>a+b,0)/live.baseline.length) : null;
-      const liveUpMean = (live.upload && live.upload.length) ? (live.upload.reduce((a,b)=>a+b,0)/live.upload.length) : null;
-      const liveDownMean = (live.download && live.download.length) ? (live.download.reduce((a,b)=>a+b,0)/live.download.length) : null;
-      const nextLabel = '#' + liveIter;
-      // if last iteration number equals liveIter, replace last values, else push
-      if(iters.length && iters[iters.length-1] === liveIter) {
-        base[base.length-1] = liveBaseMean;
-        up[up.length-1] = liveUpMean;
-        down[down.length-1] = liveDownMean;
-      } else {
-        iters.push(liveIter);
-        base.push(liveBaseMean);
-        up.push(liveUpMean);
-        down.push(liveDownMean);
-        upThr.push(null);
-        downThr.push(null);
-      }
+    const liveBaseMean = (live.baseline && live.baseline.length) ? (live.baseline.reduce((a,b)=>a+b,0)/live.baseline.length) : null;
+    const liveUpMean = (live.upload && live.upload.length) ? (live.upload.reduce((a,b)=>a+b,0)/live.upload.length) : null;
+    const liveDownMean = (live.download && live.download.length) ? (live.download.reduce((a,b)=>a+b,0)/live.download.length) : null;
+    if(iters.length && iters[iters.length-1] === liveIter) {
+      base[base.length-1] = liveBaseMean;
+      up[up.length-1] = liveUpMean;
+      down[down.length-1] = liveDownMean;
+    } else {
+      iters.push(liveIter);
+      base.push(liveBaseMean);
+      up.push(liveUpMean);
+      down.push(liveDownMean);
+      upThr.push(null);
+      downThr.push(null);
     }
   }
-
   return {
     iterations: iters,
     baseline_mean: base,
@@ -337,59 +327,102 @@ function setSummary(locSummary, loc){
   $('sb_thr').innerText = ((upThr.mean!==undefined)||(downThr.mean!==undefined)) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
 }
 
-async function updateStatus(){
+/* SSE handling */
+let sseConnected = false;
+let es = null;
+function startSSE(){
+  if(typeof(EventSource) === "undefined") {
+    console.log("SSE not supported in this browser — falling back to polling");
+    sseConnected = false;
+    return;
+  }
   try {
-    const res = await fetch('/status');
-    const data = await res.json();
-    $('statusPill').innerText = data.running ? ('▶ ' + (data.current_location||'') + ' · iter ' + (data.current_iteration||0)) : 'idle';
-    $('lastMsg').innerText = data.last_message || '(esperando...)';
-    const logs = data.logs || [];
-    if(logs.length===0) $('logbox').innerText = '(no hay logs todavía)';
-    else {
-      let txt = '';
-      logs.slice(-6).reverse().forEach(it=> {
-        txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
-        txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
-      });
-      $('logbox').innerText = txt;
-    }
+    es = new EventSource('/stream');
+    es.onopen = () => { sseConnected = true; console.log("SSE connected"); };
+    es.onerror = (e) => { sseConnected = false; console.warn("SSE error", e); };
+    es.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        // update UI pieces quickly from SSE
+        $('statusPill').innerText = d.running ? ('▶ ' + (d.current_location||'') + ' · iter ' + (d.current_iteration||0)) : 'idle';
+        $('lastMsg').innerText = d.last_message || '(esperando...)';
+        const logs = d.logs || [];
+        if(logs.length===0) $('logbox').innerText = '(no hay logs todavía)';
+        else {
+          let txt = '';
+          logs.slice(-6).reverse().forEach(it => {
+            txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
+            txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
+          });
+          $('logbox').innerText = txt;
+        }
 
-    // determine which location to show
-    const userSel = document.getElementById('locList').querySelector('.loc-btn.active');
-    let viewLoc = userSel ? userSel.dataset.loc : data.current_location;
-    if(!viewLoc){ const keys = Object.keys(data.summary || {}); if(keys.length) viewLoc = keys[keys.length-1]; }
+        // determine viewing location
+        const userSel = document.getElementById('locList').querySelector('.loc-btn.active');
+        let viewLoc = userSel ? userSel.dataset.loc : d.current_location;
+        if(!viewLoc) {
+          const keys = Object.keys(d.summary || {});
+          if(keys.length) viewLoc = keys[keys.length-1];
+        }
+        const locSummary = (d.summary||{})[viewLoc] || d.current_location_summary || null;
 
-    const locSummary = (data.summary||{})[viewLoc] || data.current_location_summary || null;
+        // build history: prefer server-provided history for current location, then merge live
+        let history = d.current_location_history || null;
+        if(history && d.current_location === viewLoc) {
+          const merged = mergeHistoryWithLive(history, d.live || null);
+          updateCharts(merged);
+        } else {
+          // try derive from logs in payload
+          const items = (d.logs || []).filter(it => it.location === viewLoc);
+          if(items.length){
+            history = {
+              iterations: items.map(it=>it.iteration),
+              baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null),
+              up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null),
+              down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null),
+              upload_mbps: items.map(it => it.upload_mbps ?? null),
+              download_mbps: items.map(it => it.download_mbps ?? null)
+            };
+            // merge with live only if live pertains to this viewLoc
+            const live = (d.live && d.live.location === viewLoc) ? d.live : null;
+            const merged = mergeHistoryWithLive(history, live);
+            updateCharts(merged);
+          } else {
+            // no history: create minimal live-only history if live available
+            if(d.live && d.live.location === viewLoc) {
+              const live = d.live;
+              const itr = live.iteration !== null ? live.iteration : (d.current_iteration || 0);
+              const h = {
+                iterations: [itr],
+                baseline_mean: [ (live.baseline && live.baseline.length) ? (live.baseline.reduce((a,b)=>a+b,0)/live.baseline.length) : null ],
+                up_mean: [ (live.upload && live.upload.length) ? (live.upload.reduce((a,b)=>a+b,0)/live.upload.length) : null ],
+                down_mean: [ (live.download && live.download.length) ? (live.download.reduce((a,b)=>a+b,0)/live.download.length) : null ],
+                upload_mbps: [ null ],
+                download_mbps: [ null ]
+              };
+              updateCharts(h);
+            }
+          }
+        }
 
-    // merge history with live samples if current location matches viewLoc
-    let history = null;
-    if(data.current_location_history && data.current_location === viewLoc) {
-      // include live from data.live if present
-      const live = data.live || null;
-      history = mergeHistoryWithLive(data.current_location_history, live);
-    } else {
-      // try build from logs
-      const items = (data.logs || []).filter(it => it.location === viewLoc);
-      if(items.length){
-        history = {
-          iterations: items.map(it=>it.iteration),
-          baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null),
-          up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null),
-          down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null),
-          upload_mbps: items.map(it => it.upload_mbps ?? null),
-          download_mbps: items.map(it => it.download_mbps ?? null)
-        };
+        setSummary(locSummary, viewLoc);
+      } catch(err) {
+        console.error("SSE message parse error", err);
       }
-    }
-
-    setSummary(locSummary, viewLoc);
-    updateCharts(history);
-  } catch (e) {
-    console.error('updateStatus failed', e);
+    };
+  } catch(e) {
+    console.warn("SSE init failed", e);
+    sseConnected = false;
   }
 }
 
-/* UI actions */
+/* Polling fallback (less frequent for logs/summary) */
+async function pollStatus(){
+  if(sseConnected) return; // prefer SSE
+  await updateStatus();
+}
+
+/* UI bindings */
 $('startBtn').addEventListener('click', async ()=>{
   const form = new FormData();
   form.append('server', $('serverInput').value);
@@ -415,7 +448,13 @@ $('nextLoc').addEventListener('click', ()=>{ const btns = Array.from(document.qu
 function selectLocation(l){ setActiveLocButton(l); updateStatus(); }
 
 /* Init */
-window.addEventListener('load', ()=>{ initLocButtons(); setActiveLocButton(LOCS[0]||''); createCharts(); updateStatus(); /* faster polling for more live feeling */ setInterval(updateStatus, 700); window.addEventListener('orientationchange', ()=> { for(let k in charts) charts[k]?.resize(); }); });
+window.addEventListener('load', ()=>{
+  initLocButtons();
+  setActiveLocButton(LOCS[0]||'');
+  createCharts();
+  startSSE();          // start SSE stream (preferred)
+  setInterval(pollStatus, 3000); // fallback polling for non-SSE or to fetch large payloads occasionally
+});
 </script>
 </body>
 </html>
@@ -424,7 +463,7 @@ window.addEventListener('load', ()=>{ initLocButtons(); setActiveLocButton(LOCS[
 # Safely replace marker with JSON list of locations
 INDEX_HTML = INDEX_HTML.replace('@@LOCATIONS@@', json.dumps(LOCATIONS))
 
-# ---------- Backend utility functions ----------
+# ---------- Backend utility functions (same as previous live script) ----------
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
@@ -464,20 +503,12 @@ def get_rssi():
         return None
     return None
 
+# Reuse robust run_ping_collect (system ping) with append_to support
 def run_ping_collect(host, duration_s=60, interval=0.2, append_to=None):
-    """
-    Robust ping collector that uses the system 'ping' binary (the same used by console).
-    - Attempts to use '-w' (deadline) and falls back to '-c' (count) if needed.
-    - If 'append_to' is provided (a list), each parsed RTT is appended to it in real-time.
-    - Returns the list of RTTs parsed (also appended_to if given).
-    """
     import shutil
-
     rtts = []
     ping_exe = shutil.which('ping') or '/data/data/com.termux/files/usr/bin/ping'
-    # use ping_exe if available and executable
     if not (ping_exe and os.path.isfile(ping_exe) and os.access(ping_exe, os.X_OK)):
-        # search common locations
         for p in ['/system/bin/ping', '/usr/bin/ping', '/bin/ping']:
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 ping_exe = p
@@ -486,13 +517,11 @@ def run_ping_collect(host, duration_s=60, interval=0.2, append_to=None):
         log(f"run_ping_collect: 'ping' no encontrado. ping_exe={ping_exe}")
         return rtts
 
-    # Try using -w deadline
     cmd = [ping_exe, '-i', str(interval), '-w', str(int(duration_s)), host]
     proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except Exception:
-        # fallback to -c
         count = max(2, int(duration_s / interval))
         cmd = [ping_exe, '-i', str(interval), '-c', str(count), host]
         try:
@@ -558,6 +587,7 @@ def run_ping_collect(host, duration_s=60, interval=0.2, append_to=None):
 
     return rtts
 
+# (Other helper functions: percentile, compute_ping_stats, run_iperf3, etc.)
 def percentile(sorted_list, p):
     if not sorted_list:
         return 0.0
@@ -678,6 +708,7 @@ def compute_aggregates_for_location(loc):
         "upload_stats_mbps": stats(upload_vals)
     }
 
+# Runner thread (same as earlier live version)
 def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, baseline_s=8, auto_advance=False):
     try:
         duration_total = int(duration_total)
@@ -729,11 +760,10 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 rssi = get_rssi()
                 log(f"[{loc}][iter {it}] RSSI: {rssi}")
 
-                # --- BASELINE PHASE ---
-                ping_baseline_results = []
-                # append_to is state's live baseline list (so /status can read it)
+                # baseline
                 with state_lock:
                     append_baseline = state['live']['baseline']
+                ping_baseline_results = []
                 ping_baseline_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=baseline_s, interval=ping_interval, append_to=append_baseline)), args=(ping_baseline_results,))
                 ping_baseline_thread.start()
                 ping_baseline_thread.join(timeout=baseline_s + 3)
@@ -742,13 +772,12 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                         ping_baseline_thread.join(timeout=1)
                     except:
                         pass
-                # copy final baseline from live list (thread appended into state['live']['baseline'])
                 with state_lock:
                     final_baseline = list(state['live']['baseline'])
                 ping_stats_baseline = compute_ping_stats(final_baseline)
                 log(f"[{loc}][iter {it}] baseline ping count={ping_stats_baseline.get('count',0)} mean={ping_stats_baseline.get('mean_ms')}ms jitter_rfc={ping_stats_baseline.get('jitter_rfc3550_ms')}ms")
 
-                # --- UPLOAD PHASE ---
+                # upload
                 with state_lock:
                     append_upload = state['live']['upload']
                 ping_up_results = []
@@ -763,7 +792,7 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 with state_lock:
                     final_upload = list(state['live']['upload'])
 
-                # --- DOWNLOAD PHASE ---
+                # download
                 with state_lock:
                     append_download = state['live']['download']
                 ping_down_results = []
@@ -831,15 +860,67 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
             state['stop_requested'] = False
             state['current_location_idx'] = 0
             state['current_iteration'] = 0
-            # clear live
             state['live']['location'] = None
             state['live']['iteration'] = None
             state['live']['baseline'] = []
             state['live']['upload'] = []
             state['live']['download'] = []
 
-# ---------- Flask routes ----------
+# ---------- SSE stream endpoint ----------
+@APP.route('/stream')
+def stream():
+    def event_gen():
+        # push small JSON payload frequently; EventSource will reconnect automatically if needed
+        while True:
+            with state_lock:
+                cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
+                current_summary = state['summary'].get(cur_loc) if cur_loc else None
+                history = None
+                if cur_loc:
+                    items = [x for x in state['logs'] if x['location'] == cur_loc]
+                    if items:
+                        iterations = [it.get('iteration') for it in items]
+                        baseline_mean = [it.get('ping_stats_baseline', {}).get('mean_ms') for it in items]
+                        up_mean = [it.get('ping_stats_upload', {}).get('mean_ms') for it in items]
+                        down_mean = [it.get('ping_stats_download', {}).get('mean_ms') for it in items]
+                        upload_mbps = [it.get('upload_mbps') for it in items]
+                        download_mbps = [it.get('download_mbps') for it in items]
+                        history = {
+                            "iterations": iterations,
+                            "baseline_mean": baseline_mean,
+                            "up_mean": up_mean,
+                            "down_mean": down_mean,
+                            "upload_mbps": upload_mbps,
+                            "download_mbps": download_mbps
+                        }
+                # shallow copy of recent logs and live trimmed
+                logs_slice = state['logs'][-10:]
+                live = {
+                    "location": state['live'].get('location'),
+                    "iteration": state['live'].get('iteration'),
+                    "baseline": state['live'].get('baseline')[-200:],
+                    "upload": state['live'].get('upload')[-200:],
+                    "download": state['live'].get('download')[-200:]
+                }
+                payload = {
+                    "running": state['running'],
+                    "paused": state['paused'],
+                    "current_location": cur_loc,
+                    "current_iteration": state['current_iteration'],
+                    "last_message": state['last_message'],
+                    "logs": logs_slice,
+                    "summary": state['summary'],
+                    "current_location_summary": current_summary,
+                    "current_location_history": history,
+                    "live": live,
+                    "config": state.get('config', {})
+                }
+            # SSE message
+            yield f"data: {json.dumps(payload)}\n\n"
+            time.sleep(0.5)
+    return Response(stream_with_context(event_gen()), mimetype='text/event-stream')
 
+# ---------- Other Flask routes (start/pause/stop/status/clear/download) ----------
 @APP.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -931,7 +1012,6 @@ def status():
     with state_lock:
         cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
         current_summary = state['summary'].get(cur_loc) if cur_loc else None
-        # history for charts (current location)
         history = None
         if cur_loc:
             items = [x for x in state['logs'] if x['location'] == cur_loc]
@@ -950,7 +1030,6 @@ def status():
                     "upload_mbps": upload_mbps,
                     "download_mbps": download_mbps
                 }
-        # Include live samples (truncate lists to last 200 samples to avoid big payload)
         live_copy = {
             "location": state['live'].get('location'),
             "iteration": state['live'].get('iteration'),
@@ -1045,7 +1124,7 @@ def download_csv():
 # ---------- Run app ----------
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Termux network tester — mobile UI live charts')
+    parser = argparse.ArgumentParser(description='Termux network tester — SSE live charts')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', default=5000, type=int)
     args = parser.parse_args()
