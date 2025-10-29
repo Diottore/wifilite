@@ -2,14 +2,13 @@
 """
 run_tests.py
 
-Termux Network Tester — Mobile-first UI (archivo completo)
+Termux Network Tester — Mobile-first UI with clear controls
+(Updated: use system 'ping' binary from console)
 
-- Interfaz móvil responsive (single-column, barra inferior táctil, charts).
-- Baseline ping + ping por fase (upload/download) dividido por iteración.
-- Forzado a IPv4 para ping (-4).
-- Guarda logs detallados y exporta JSON/CSV.
-- Pausa después de cada ubicación a menos que Active "Auto".
-- Reemplazo seguro del marcador @@LOCATIONS@@ para evitar problemas con '%' en la plantilla.
+Save as run_tests.py in Termux and run:
+  python run_tests.py --host 0.0.0.0 --port 5000
+
+Requires: iperf3, termux-api, Flask
 """
 import os
 import subprocess
@@ -36,10 +35,12 @@ state = {
     "config": {}
 }
 
+# Lock for thread-safe state modifications
+state_lock = threading.Lock()
+
 LOCATIONS = ["p1","p2","p3","p4","p5","p6","p7","p8"]
 
 # ---------- Mobile-first UI template ----------
-# Uses @@LOCATIONS@@ marker that will be replaced safely below.
 INDEX_HTML = """
 <!doctype html>
 <html lang="es">
@@ -47,41 +48,32 @@ INDEX_HTML = """
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Termux Network Tester — Mobile</title>
-<link rel="preconnect" href="https://fonts.gstatic.com">
 <style>
   :root{
     --bg: #0f172a;
-    --panel: #0b1220;
     --muted: #94a3b8;
     --accent: #60a5fa;
     --accent-2: #7dd3fc;
-    --success: #34d399;
-    --danger: #fb7185;
     --glass: rgba(255,255,255,0.03);
     --card-radius: 14px;
     --gap: 12px;
     --btn-h: 52px;
     font-family: Inter, Roboto, Arial, sans-serif;
     color-scheme: dark;
-    -webkit-font-smoothing:antialiased;
-    -moz-osx-font-smoothing:grayscale;
   }
   html,body{margin:0;padding:0;height:100%;background:linear-gradient(180deg,var(--bg),#071029);color:#e6eef8}
   .app{max-width:900px;margin:0 auto;padding:12px;box-sizing:border-box}
   header{display:flex;align-items:center;gap:10px;padding-bottom:6px}
-  .logo{width:46px;height:46px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#021028;box-shadow:0 6px 18px rgba(8,10,28,0.6)}
+  .logo{width:46px;height:46px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#021028}
   h1{font-size:1.05rem;margin:0}
   .lead{font-size:0.86rem;color:var(--muted);margin-top:2px}
-  main{display:flex;flex-direction:column;gap:var(--gap);padding-bottom:84px} /* leave space for bottom bar */
+  main{display:flex;flex-direction:column;gap:var(--gap);padding-bottom:84px}
 
-  .card{background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));border-radius:var(--card-radius);padding:12px;box-shadow:0 8px 26px rgba(2,6,23,0.45)}
+  .card{background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));border-radius:var(--card-radius);padding:12px}
   .controls .row{display:flex;gap:8px;flex-wrap:wrap}
   input, select{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:10px 12px;border-radius:10px;color:inherit;font-size:0.95rem;min-width:110px}
-  input[type=number]{-moz-appearance:textfield}
-  label.small{font-size:0.82rem;color:var(--muted)}
   .controls{display:flex;flex-direction:column;gap:8px}
 
-  /* Big touch buttons */
   .actions{display:flex;gap:8px;flex-wrap:wrap}
   button.btn{height:var(--btn-h);border-radius:12px;border:0;padding:0 14px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;gap:8px}
   .btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#021028}
@@ -89,32 +81,24 @@ INDEX_HTML = """
   .btn.warn{background:linear-gradient(90deg,#f97316,#fb7185);color:#071023}
   .btn.small{height:40px;padding:0 10px;font-weight:600;border-radius:10px}
 
-  .status{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
   .pill{background:var(--glass);padding:8px 10px;border-radius:999px;font-weight:700;color:#dbeafe}
 
-  /* summary */
   .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:8px}
   .s-card{padding:10px;border-radius:10px;background:linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.02)}
   .s-card h4{margin:0;font-size:0.86rem}
   .s-val{font-weight:800;font-size:1rem;margin-top:6px}
 
-  /* charts */
-  .chart { margin-top:8px; border-radius:10px; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0.01)); border:1px solid rgba(255,255,255,0.02); padding:8px }
+  .chart{ margin-top:8px; border-radius:10px; overflow:hidden; padding:8px }
   canvas{width:100% !important;height:120px !important;display:block}
 
-  /* logs */
   .logbox{font-family:monospace;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;max-height:220px;overflow:auto;color:#cfe7ff}
 
-  /* bottom sticky bar for mobile actions */
-  .bottom-bar{position:fixed;left:0;right:0;bottom:0;background:linear-gradient(180deg, rgba(2,6,23,0.9), rgba(2,6,23,0.95));padding:10px 12px;display:flex;align-items:center;gap:8px;justify-content:space-between;box-shadow:0 -8px 30px rgba(2,6,23,0.6)}
-  .bottom-group{display:flex;gap:8px;align-items:center}
+  .bottom-bar{position:fixed;left:0;right:0;bottom:0;background:linear-gradient(180deg, rgba(2,6,23,0.9), rgba(2,6,23,0.95));padding:10px 12px;display:flex;align-items:center;gap:8px;justify-content:space-between}
   .loc-list{display:flex;gap:6px;overflow:auto;padding:6px;background:transparent}
   .loc-btn{min-width:44px;height:44px;border-radius:10px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.02);display:flex;align-items:center;justify-content:center;font-weight:700;color:#dbeafe}
   .loc-btn.active{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#021028}
 
-  /* responsive small screens */
   @media (max-width:420px){
-    .s-val{font-size:0.95rem}
     canvas{height:92px !important}
     .controls .row{flex-direction:column}
     .loc-btn{min-width:40px;height:40px;font-size:0.86rem}
@@ -160,6 +144,8 @@ INDEX_HTML = """
           <button class="btn warn" id="stopBtn">■ Detener</button>
           <button class="btn ghost" id="jsonBtn">⬇ JSON</button>
           <button class="btn ghost" id="csvBtn">⬇ CSV</button>
+          <button class="btn ghost" id="clearLocBtn">🧹 Limpiar ubicación</button>
+          <button class="btn ghost" id="clearAllBtn">🧼 Limpiar todo</button>
         </div>
 
         <div class="status" style="margin-top:8px">
@@ -210,174 +196,92 @@ INDEX_HTML = """
   </main>
 </div>
 
-<!-- bottom bar: locations + quick actions -->
 <div class="bottom-bar" role="toolbar" aria-label="Acciones rápidas">
-  <div class="loc-list" id="locList" aria-hidden="false">
-    <!-- location buttons injected by JS -->
-  </div>
+  <div class="loc-list" id="locList"></div>
   <div class="bottom-group">
     <button class="btn small ghost" id="prevLoc">◀</button>
     <button class="btn small ghost" id="nextLoc">▶</button>
   </div>
 </div>
 
-<!-- Chart.js (lightweight) via CDN -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-/* ---------- Client JS (mobile-first) ---------- */
 const LOCS = @@LOCATIONS@@;
 let charts = { baseline:null, rtt:null, thr:null };
-let selectedLoc = null;
 
-/* helpers */
 const $ = id => document.getElementById(id);
 
 function initLocButtons(){
   const container = $('locList');
   container.innerHTML = '';
-  LOCS.forEach((l, idx) => {
+  LOCS.forEach((l) => {
     const b = document.createElement('button');
     b.className = 'loc-btn';
     b.innerText = l.toUpperCase();
     b.dataset.loc = l;
-    b.addEventListener('click', ()=> {
-      selectLocation(l);
-    });
+    b.addEventListener('click', ()=> selectLocation(l));
     container.appendChild(b);
   });
 }
 
 function setActiveLocButton(loc){
-  selectedLoc = loc;
   const btns = document.querySelectorAll('.loc-btn');
-  btns.forEach(b => {
-    if(b.dataset.loc === loc) b.classList.add('active');
-    else b.classList.remove('active');
-  });
+  btns.forEach(b => b.classList.toggle('active', b.dataset.loc === loc));
 }
 
-/* create charts */
 function createCharts(){
   if(charts.baseline) return;
-  const ctxB = $('chartBaseline').getContext('2d');
-  charts.baseline = new Chart(ctxB, { type:'line',
-    data:{ labels:[], datasets:[{label:'baseline', data:[], borderColor:'#60a5fa', backgroundColor:'rgba(96,165,250,0.08)', tension:0.3, pointRadius:0}]},
-    options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{ticks:{maxTicksLimit:4}}}}
-  });
-  const ctxR = $('chartRTT').getContext('2d');
-  charts.rtt = new Chart(ctxR, { type:'line',
-    data:{ labels:[], datasets:[
-      {label:'upload', data:[], borderColor:'#34d399', backgroundColor:'rgba(52,211,153,0.06)', tension:0.3, pointRadius:0},
-      {label:'download', data:[], borderColor:'#fb7185', backgroundColor:'rgba(251,113,133,0.06)', tension:0.3, pointRadius:0}
-    ]},
-    options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}, scales:{x:{display:false}, y:{ticks:{maxTicksLimit:4}}}}
-  });
-  const ctxT = $('chartThroughput').getContext('2d');
-  charts.thr = new Chart(ctxT, { type:'line',
-    data:{ labels:[], datasets:[
-      {label:'upload Mbps', data:[], borderColor:'#a78bfa', backgroundColor:'rgba(167,139,250,0.06)', tension:0.3, pointRadius:0},
-      {label:'download Mbps', data:[], borderColor:'#fb923c', backgroundColor:'rgba(251,146,60,0.06)', tension:0.3, pointRadius:0}
-    ]},
-    options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}, scales:{x:{display:false}, y:{beginAtZero:true,ticks:{maxTicksLimit:4}}}}
-  });
+  charts.baseline = new Chart($('chartBaseline').getContext('2d'), { type:'line', data:{ labels:[], datasets:[{label:'baseline', data:[], borderColor:'#60a5fa', backgroundColor:'rgba(96,165,250,0.08)', tension:0.3, pointRadius:0}]}, options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{display:false}}}});
+  charts.rtt = new Chart($('chartRTT').getContext('2d'), { type:'line', data:{ labels:[], datasets:[{label:'upload', data:[], borderColor:'#34d399'},{label:'download', data:[], borderColor:'#fb7185'}]}, options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}}});
+  charts.thr = new Chart($('chartThroughput').getContext('2d'), { type:'line', data:{ labels:[], datasets:[{label:'upload Mbps', data:[], borderColor:'#a78bfa'},{label:'download Mbps', data:[], borderColor:'#fb923c'}]}, options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}}});
 }
 
 function updateCharts(history){
   createCharts();
-  if(!history || !history.iterations || history.iterations.length===0){
-    // clear
-    for(let k in charts){
-      charts[k].data.labels = [];
-      charts[k].data.datasets.forEach(ds=>ds.data = []);
-      charts[k].update();
-    }
-    return;
-  }
+  if(!history){ for(let k in charts){ charts[k].data.labels=[]; charts[k].data.datasets.forEach(ds=>ds.data=[]); charts[k].update(); } return; }
   const labels = history.iterations.map(i=>'#'+i);
-  charts.baseline.data.labels = labels;
-  charts.baseline.data.datasets[0].data = history.baseline_mean.map(v => v===null?NaN:v);
-  charts.baseline.update();
-
-  charts.rtt.data.labels = labels;
-  charts.rtt.data.datasets[0].data = history.up_mean.map(v => v===null?NaN:v);
-  charts.rtt.data.datasets[1].data = history.down_mean.map(v => v===null?NaN:v);
-  charts.rtt.update();
-
-  charts.thr.data.labels = labels;
-  charts.thr.data.datasets[0].data = history.upload_mbps.map(v => v===null?NaN:v);
-  charts.thr.data.datasets[1].data = history.download_mbps.map(v => v===null?NaN:v);
-  charts.thr.update();
+  charts.baseline.data.labels = labels; charts.baseline.data.datasets[0].data = history.baseline_mean.map(v=>v===null?NaN:v); charts.baseline.update();
+  charts.rtt.data.labels = labels; charts.rtt.data.datasets[0].data = history.up_mean.map(v=>v===null?NaN:v); charts.rtt.data.datasets[1].data = history.down_mean.map(v=>v===null?NaN:v); charts.rtt.update();
+  charts.thr.data.labels = labels; charts.thr.data.datasets[0].data = history.upload_mbps.map(v=>v===null?NaN:v); charts.thr.data.datasets[1].data = history.download_mbps.map(v=>v===null?NaN:v); charts.thr.update();
 }
 
-/* UI set values */
 function setSummary(locSummary, loc){
   $('summaryLoc').innerText = loc || '—';
   const base = (locSummary && locSummary.ping_baseline_mean_stats) || {};
   const up = (locSummary && locSummary.ping_upload_mean_stats) || {};
   const down = (locSummary && locSummary.ping_download_mean_stats) || {};
   const upThr = (locSummary && locSummary.upload_stats_mbps) || {};
-  const downThr = (locSummary && locSummary.download_stats_mbps) || {};
   $('sb_baseline').innerText = (base.mean!==undefined) ? `${base.mean} / ${base.median} / ${base.p95}` : '—';
   $('sb_up').innerText = (up.mean!==undefined) ? `${up.mean} / ${up.median} / ${up.p95}` : '—';
   $('sb_down').innerText = (down.mean!==undefined) ? `${down.mean} / ${down.median} / ${down.p95}` : '—';
   $('sb_thr').innerText = ((upThr.mean!==undefined)||(downThr.mean!==undefined)) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
 }
 
-/* fetch status and render */
 async function updateStatus(){
   try{
     const res = await fetch('/status');
     const data = await res.json();
     $('statusPill').innerText = data.running ? ('▶ ' + (data.current_location||'') + ' · iter ' + (data.current_iteration||0)) : 'idle';
     $('lastMsg').innerText = data.last_message || '(esperando...)';
-
-    // logs
     const logs = data.logs || [];
     if(logs.length===0) $('logbox').innerText = '(no hay logs todavía)';
-    else {
-      let txt = '';
-      logs.slice(-6).reverse().forEach(it => {
-        txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
-        txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
-      });
-      $('logbox').innerText = txt;
-    }
-
-    // which location to show (user selection has priority)
+    else { let txt=''; logs.slice(-6).reverse().forEach(it=>{ txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`; txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`; }); $('logbox').innerText = txt; }
     const userSel = document.getElementById('locList').querySelector('.loc-btn.active');
     let viewLoc = userSel ? userSel.dataset.loc : data.current_location;
-    if(!viewLoc){
-      // fallback to last summary key
-      const keys = Object.keys(data.summary || {});
-      if(keys.length) viewLoc = keys[keys.length-1];
-    }
-    // summary and history
+    if(!viewLoc){ const keys = Object.keys(data.summary || {}); if(keys.length) viewLoc = keys[keys.length-1]; }
     const locSummary = (data.summary||{})[viewLoc] || data.current_location_summary || null;
     setSummary(locSummary, viewLoc);
-    // use backend history when viewing current location, else try to build from logs
     let history = data.current_location_history || null;
     if(!history && viewLoc){
       const items = (data.logs || []).filter(it => it.location === viewLoc);
       if(items.length){
-        history = {
-          iterations: items.map(it=>it.iteration),
-          baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null),
-          up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null),
-          down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null),
-          upload_mbps: items.map(it => it.upload_mbps ?? null),
-          download_mbps: items.map(it => it.download_mbps ?? null),
-        };
+        history = { iterations: items.map(it=>it.iteration), baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null), up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null), down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null), upload_mbps: items.map(it => it.upload_mbps ?? null), download_mbps: items.map(it => it.download_mbps ?? null) };
       }
     }
     updateCharts(history);
-
-    // progress approximation (not shown visually here, reserved for future)
-  }catch(e){
-    console.error('updateStatus failed', e);
-  }
+  }catch(e){ console.error('updateStatus failed', e); }
 }
 
-/* Actions */
 $('startBtn').addEventListener('click', async ()=>{
   const form = new FormData();
   form.append('server', $('serverInput').value);
@@ -386,47 +290,23 @@ $('startBtn').addEventListener('click', async ()=>{
   form.append('baseline', $('baselineInput').value);
   form.append('ping_interval', $('pingInterval').value);
   form.append('auto', $('autoChk').checked ? '1' : '');
-  await fetch('/start', { method:'POST', body:form }).then(r=>r.json()).then(j => {
-    if(j.error) alert('Error: '+j.error);
-    updateStatus();
-  }).catch(e=>alert('start error: '+e));
+  await fetch('/start', { method:'POST', body:form }).then(r=>r.json()).then(j => { if(j.error) alert('Error: '+j.error); updateStatus(); }).catch(e=>alert('start error: '+e));
 });
-
 $('pauseBtn').addEventListener('click', ()=> fetch('/pause',{method:'POST'}).then(()=>updateStatus()));
 $('resumeBtn').addEventListener('click', ()=> fetch('/resume',{method:'POST'}).then(()=>updateStatus()));
 $('stopBtn').addEventListener('click', ()=> fetch('/stop',{method:'POST'}).then(()=>updateStatus()));
 $('jsonBtn').addEventListener('click', ()=> location.href='/download/json');
 $('csvBtn').addEventListener('click', ()=> location.href='/download/csv');
 
-$('prevLoc').addEventListener('click', ()=>{
-  const btns = Array.from(document.querySelectorAll('.loc-btn'));
-  const idx = btns.findIndex(b => b.classList.contains('active'));
-  const next = idx > 0 ? btns[idx-1] : btns[btns.length-1];
-  next.click();
-});
-$('nextLoc').addEventListener('click', ()=>{
-  const btns = Array.from(document.querySelectorAll('.loc-btn'));
-  const idx = btns.findIndex(b => b.classList.contains('active'));
-  const next = (idx < btns.length-1) ? btns[idx+1] : btns[0];
-  next.click();
-});
+$('clearAllBtn').addEventListener('click', async ()=>{ if(!confirm('¿Borrar todos los logs y resúmenes?')) return; const res = await fetch('/clear_all',{method:'POST'}); const j = await res.json(); if(j.ok){ alert('Todos los logs y resúmenes fueron eliminados.'); updateStatus(); } else alert('No fue posible limpiar: '+(j.error||'')); });
+$('clearLocBtn').addEventListener('click', async ()=>{ const active = document.querySelector('.loc-btn.active'); if(!active){ alert('Selecciona primero una ubicación (p1..p8).'); return; } const loc = active.dataset.loc; if(!confirm(`¿Borrar logs y resumen para ${loc}?`)) return; const form = new FormData(); form.append('location', loc); const res = await fetch('/clear_location',{method:'POST', body: form}); const j = await res.json(); if(j.ok){ alert(`Logs y resumen de ${loc} eliminados.`); updateStatus(); } else alert('No fue posible limpiar: '+(j.error||'')); });
 
-function selectLocation(l){
-  setActiveLocButton(l);
-  updateStatus();
-}
+$('prevLoc').addEventListener('click', ()=>{ const btns = Array.from(document.querySelectorAll('.loc-btn')); const idx = btns.findIndex(b => b.classList.contains('active')); const next = idx > 0 ? btns[idx-1] : btns[btns.length-1]; next.click(); });
+$('nextLoc').addEventListener('click', ()=>{ const btns = Array.from(document.querySelectorAll('.loc-btn')); const idx = btns.findIndex(b => b.classList.contains('active')); const next = (idx < btns.length-1) ? btns[idx+1] : btns[0]; next.click(); });
 
-/* initialize */
-window.addEventListener('load', ()=>{
-  initLocButtons();
-  // default select first location
-  setActiveLocButton(LOCS[0] || '');
-  createCharts();
-  updateStatus();
-  setInterval(updateStatus, 1500);
-  // make charts responsive on orientation
-  window.addEventListener('orientationchange', ()=> { for(let k in charts) charts[k]?.resize(); });
-});
+function selectLocation(l){ setActiveLocButton(l); updateStatus(); }
+
+window.addEventListener('load', ()=>{ initLocButtons(); setActiveLocButton(LOCS[0]||''); createCharts(); updateStatus(); setInterval(updateStatus, 1500); window.addEventListener('orientationchange', ()=> { for(let k in charts) charts[k]?.resize(); }); });
 </script>
 </body>
 </html>
@@ -439,7 +319,8 @@ INDEX_HTML = INDEX_HTML.replace('@@LOCATIONS@@', json.dumps(LOCATIONS))
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
-    state['last_message'] = f"{ts} {msg}"
+    with state_lock:
+        state['last_message'] = f"{ts} {msg}"
     print(state['last_message'], flush=True)
 
 def safe_call(cmd, timeout=None):
@@ -476,52 +357,100 @@ def get_rssi():
 
 def run_ping_collect(host, duration_s=60, interval=0.2):
     """
-    Run ping and collect RTT samples in ms. For safety force IPv4 (-4).
-    Uses -w deadline when available, otherwise falls back to -c count.
+    Robust ping collector that uses the system 'ping' binary (the same used by console).
+    - Does NOT force -4 or a specific path; it searches shutil.which('ping') first.
+    - Attempts to use '-w' (deadline) and falls back to '-c' (count) if needed.
+    - Captures stdout/stderr for diagnostics and logs a snippet if no RTTs parsed.
     """
+    import shutil
+
     rtts = []
-    cmd = ['ping', '-4', '-i', str(interval), '-w', str(int(duration_s)), host]
+    # Find system 'ping' (as used from console)
+    ping_exe = shutil.which('ping')
+    # fallback common paths
+    candidates = [ping_exe, '/data/data/com.termux/files/usr/bin/ping', '/system/bin/ping', '/usr/bin/ping', '/bin/ping']
+    ping_path = None
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                ping_path = p
+                break
+        except Exception:
+            continue
+    if not ping_path:
+        log(f"run_ping_collect: no se encontró 'ping' en PATH ni en rutas comunes. candidates={candidates}")
+        return rtts
+
+    # Try using -w first (deadline)
+    cmd = [ping_path, '-i', str(interval), '-w', str(int(duration_s)), host]
+    use_count = False
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except Exception:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+        # fallback to -c
+        use_count = True
+
+    if use_count:
         count = max(2, int(duration_s / interval))
-        cmd = ['ping', '-4', '-i', str(interval), '-c', str(count), host]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        cmd = [ping_path, '-i', str(interval), '-c', str(count), host]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            log(f"run_ping_collect: fallo al ejecutar ping fallback: {e}")
+            return rtts
 
     start = time.time()
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
-            if time.time() - start > duration_s + 5:
-                try: proc.kill()
-                except: pass
-                break
-            continue
-        line = line.strip()
-        if 'time=' in line:
-            try:
-                idx = line.rfind('time=')
-                token = line[idx+5:]
-                parts = token.split()
-                rtt = float(parts[0])
-                rtts.append(rtt)
-            except Exception:
-                pass
-        if time.time() - start > duration_s:
-            time.sleep(0.05)
-            try:
-                proc.terminate()
-            except:
-                pass
-            break
+    stdout_chunks = []
+    stderr_chunks = []
     try:
-        proc.wait(timeout=1)
-    except:
-        try: proc.kill()
-        except: pass
+        while True:
+            line = proc.stdout.readline()
+            if line:
+                stdout_chunks.append(line)
+                line_str = line.strip()
+                if 'time=' in line_str:
+                    try:
+                        idx = line_str.rfind('time=')
+                        token = line_str[idx+5:]
+                        parts = token.split()
+                        rtt = float(parts[0])
+                        rtts.append(rtt)
+                    except Exception:
+                        pass
+            else:
+                if proc.poll() is not None:
+                    break
+                if time.time() - start > duration_s + 10:
+                    try:
+                        proc.kill()
+                    except:
+                        pass
+                    break
+                time.sleep(0.05)
+        try:
+            se = proc.stderr.read()
+            if se:
+                stderr_chunks.append(se)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            out, err = proc.communicate(timeout=2)
+            if out:
+                stdout_chunks.append(out)
+            if err:
+                stderr_chunks.append(err)
+        except Exception:
+            pass
+        log(f"run_ping_collect: excepción leyendo stdout/stderr: {e}")
+
+    if not rtts:
+        combined = ''.join(stdout_chunks) + '\n' + ''.join(stderr_chunks)
+        snippet = combined[:4000] + ('...[truncated]' if len(combined) > 4000 else '')
+        log(f"run_ping_collect: no se parsearon RTTs para host={host}. cmd={cmd} output_snippet={snippet}")
+
     return rtts
 
 def percentile(sorted_list, p):
@@ -651,28 +580,30 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
         up_dur = duration_total // 2
         down_dur = duration_total - up_dur
 
-        state['running'] = True
-        state['paused'] = False
-        state['stop_requested'] = False
-        state['current_location_idx'] = 0
-        state['current_iteration'] = 0
-        state['logs'] = []
-        state['summary'] = {}
-        state['config'] = {
-            "server": server,
-            "iters_per_loc": iters_per_loc,
-            "duration_total": duration_total,
-            "upload_s": up_dur,
-            "download_s": down_dur,
-            "ping_interval": ping_interval,
-            "baseline_s": baseline_s
-        }
+        with state_lock:
+            state['running'] = True
+            state['paused'] = False
+            state['stop_requested'] = False
+            state['current_location_idx'] = 0
+            state['current_iteration'] = 0
+            state['logs'] = []
+            state['summary'] = {}
+            state['config'] = {
+                "server": server,
+                "iters_per_loc": iters_per_loc,
+                "duration_total": duration_total,
+                "upload_s": up_dur,
+                "download_s": down_dur,
+                "ping_interval": ping_interval,
+                "baseline_s": baseline_s
+            }
         log(f"Runner started server={server} iters={iters_per_loc} total_duration={duration_total}s (upload={up_dur}s download={down_dur}s) baseline={baseline_s}s ping_interval={ping_interval}s auto={auto_advance}")
 
         for loc_idx, loc in enumerate(LOCATIONS):
             if state['stop_requested']:
                 break
-            state['current_location_idx'] = loc_idx
+            with state_lock:
+                state['current_location_idx'] = loc_idx
             log(f"Starting location {loc} ({loc_idx+1}/{len(LOCATIONS)})")
             for it in range(1, iters_per_loc+1):
                 if state['stop_requested']:
@@ -680,7 +611,8 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 while state['paused'] and not state['stop_requested']:
                     log(f"Paused at {loc} iteration {it}...")
                     time.sleep(1)
-                state['current_iteration'] = it
+                with state_lock:
+                    state['current_iteration'] = it
                 timestamp = datetime.utcnow().isoformat() + 'Z'
                 rssi = get_rssi()
                 log(f"[{loc}][iter {it}] RSSI: {rssi}")
@@ -748,12 +680,15 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                     "iperf_upload_raw": iperf_up,
                     "iperf_download_raw": iperf_down
                 }
-                state['logs'].append(entry)
+                with state_lock:
+                    state['logs'].append(entry)
 
-            state['summary'][loc] = compute_aggregates_for_location(loc)
+            with state_lock:
+                state['summary'][loc] = compute_aggregates_for_location(loc)
             log(f"Finished location {loc}. aggregates updated.")
             if not auto_advance:
-                state['paused'] = True
+                with state_lock:
+                    state['paused'] = True
                 log(f"Paused after {loc}. Press Reanudar to continue.")
                 while state['paused'] and not state['stop_requested']:
                     time.sleep(1)
@@ -762,13 +697,16 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
     except Exception as e:
         log(f"Runner exception: {e}")
     finally:
-        state['running'] = False
-        state['paused'] = False
-        state['stop_requested'] = False
-        state['current_location_idx'] = 0
-        state['current_iteration'] = 0
+        with state_lock:
+            state['running'] = False
+            state['paused'] = False
+            state['stop_requested'] = False
+            state['current_location_idx'] = 0
+            state['current_iteration'] = 0
 
-# ---------- Flask routes ----------
+# Flask routes (clear_all, clear_location, status, start, pause, resume, stop, download) unchanged
+# Reuse handlers from earlier in file (they are defined below)
+
 @APP.route('/')
 def index():
     return render_template_string(INDEX_HTML)
@@ -810,29 +748,55 @@ def start():
 def pause():
     if not state['running']:
         return jsonify({"error":"not running"}), 400
-    state['paused'] = True
+    with state_lock:
+        state['paused'] = True
     return jsonify({"message":"paused"})
 
 @APP.route('/resume', methods=['POST'])
 def resume():
     if not state['running']:
         return jsonify({"error":"not running"}), 400
-    state['paused'] = False
+    with state_lock:
+        state['paused'] = False
     return jsonify({"message":"resumed"})
 
 @APP.route('/stop', methods=['POST'])
 def stop():
     if not state['running']:
         return jsonify({"error":"not running"}), 400
-    state['stop_requested'] = True
-    state['paused'] = False
+    with state_lock:
+        state['stop_requested'] = True
+        state['paused'] = False
     return jsonify({"message":"stop requested"})
+
+@APP.route('/clear_all', methods=['POST'])
+def clear_all():
+    with state_lock:
+        state['logs'] = []
+        state['summary'] = {}
+    log("All logs and summaries cleared via UI.")
+    return jsonify({"ok": True})
+
+@APP.route('/clear_location', methods=['POST'])
+def clear_location():
+    loc = request.form.get('location') or request.args.get('location')
+    if not loc:
+        return jsonify({"error": "location parameter required"}), 400
+    if loc not in LOCATIONS:
+        return jsonify({"error": f"unknown location {loc}"}), 400
+    with state_lock:
+        before = len(state['logs'])
+        state['logs'] = [entry for entry in state['logs'] if entry.get('location') != loc]
+        if loc in state['summary']:
+            del state['summary'][loc]
+        after = len(state['logs'])
+    log(f"Cleared logs for {loc} ({before-after} entries removed).")
+    return jsonify({"ok": True, "removed": before-after})
 
 @APP.route('/status', methods=['GET'])
 def status():
     cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
     current_summary = state['summary'].get(cur_loc) if cur_loc else None
-    # history for charts (current location)
     history = None
     if cur_loc:
         items = [x for x in state['logs'] if x['location'] == cur_loc]
@@ -851,17 +815,22 @@ def status():
                 "upload_mbps": upload_mbps,
                 "download_mbps": download_mbps
             }
+    with state_lock:
+        cfg = state.get('config', {})
+        last_msg = state.get('last_message', '')
+        logs_slice = state['logs'][-30:]
+        summ = state['summary'].copy()
     return jsonify({
         "running": state['running'],
         "paused": state['paused'],
         "current_location": cur_loc,
         "current_iteration": state['current_iteration'],
-        "last_message": state.get('last_message'),
-        "logs": state['logs'][-30:],
-        "summary": state['summary'],
+        "last_message": last_msg,
+        "logs": logs_slice,
+        "summary": summ,
         "current_location_summary": current_summary,
         "current_location_history": history,
-        "config": state.get('config', {})
+        "config": cfg
     })
 
 @APP.route('/download/json')
@@ -881,13 +850,9 @@ def download_csv():
     fn = f"termux_network_test_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
     fieldnames = [
         "timestamp","location","iteration","rssi",
-        # baseline ping stats
         "baseline_seconds","ping_baseline_count","ping_baseline_mean_ms","ping_baseline_median_ms","ping_baseline_p95_ms","ping_baseline_jitter_rfc3550_ms","ping_baseline_jitter_simple_mean_ms",
-        # upload ping stats
         "upload_seconds","ping_upload_count","ping_upload_mean_ms","ping_upload_median_ms","ping_upload_p95_ms","ping_upload_jitter_rfc3550_ms","ping_upload_jitter_simple_mean_ms",
-        # download ping stats
         "download_seconds","ping_download_count","ping_download_mean_ms","ping_download_median_ms","ping_download_p95_ms","ping_download_jitter_rfc3550_ms","ping_download_jitter_simple_mean_ms",
-        # throughput
         "download_mbps","upload_mbps"
     ]
     with open(fn, 'w', newline='', encoding='utf-8') as csvfile:
@@ -931,7 +896,6 @@ def download_csv():
             })
     return send_file(fn, as_attachment=True)
 
-# ---------- Run app ----------
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Termux network tester — mobile UI')
