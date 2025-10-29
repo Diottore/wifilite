@@ -2,13 +2,20 @@
 """
 run_tests.py
 
-Termux Network Tester — Mobile-first UI with clear controls
-(Updated: use system 'ping' binary from console)
+Termux Network Tester — Mobile-first UI with live-updating charts
 
-Save as run_tests.py in Termux and run:
-  python run_tests.py --host 0.0.0.0 --port 5000
+Changes in this version (requested):
+- Charts update more constantly during an ongoing measurement (not only when logs are flushed).
+- Implemented live sample streaming from the ping threads into shared state['live'] lists.
+- /status now returns current live-sample summaries so the frontend can show incremental updates.
+- Frontend polling for status is slightly faster for more responsive charts.
+- Thread-safe access to shared state via state_lock.
 
-Requires: iperf3, termux-api, Flask
+Usage:
+- Save as run_tests.py in Termux
+- Install requirements: pkg install python iperf3 termux-api; pip install Flask
+- Run: python run_tests.py --host 0.0.0.0 --port 5000
+- Open in the phone browser: http://localhost:5000
 """
 import os
 import subprocess
@@ -32,7 +39,15 @@ state = {
     "logs": [],
     "summary": {},
     "last_message": "",
-    "config": {}
+    "config": {},
+    # live holds per-iteration in-progress ping samples for baseline/upload/download
+    "live": {
+        "location": None,
+        "iteration": None,
+        "baseline": [],   # raw RTT samples (ms)
+        "upload": [],
+        "download": []
+    }
 }
 
 # Lock for thread-safe state modifications
@@ -41,13 +56,14 @@ state_lock = threading.Lock()
 LOCATIONS = ["p1","p2","p3","p4","p5","p6","p7","p8"]
 
 # ---------- Mobile-first UI template ----------
+# Uses @@LOCATIONS@@ marker that will be replaced safely below.
 INDEX_HTML = """
 <!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Termux Network Tester — Mobile</title>
+<title>Termux Network Tester — Live Charts</title>
 <style>
   :root{
     --bg: #0f172a;
@@ -206,6 +222,7 @@ INDEX_HTML = """
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
+/* Client-side: faster polling and live sample merge for charts */
 const LOCS = @@LOCATIONS@@;
 let charts = { baseline:null, rtt:null, thr:null };
 
@@ -236,13 +253,76 @@ function createCharts(){
   charts.thr = new Chart($('chartThroughput').getContext('2d'), { type:'line', data:{ labels:[], datasets:[{label:'upload Mbps', data:[], borderColor:'#a78bfa'},{label:'download Mbps', data:[], borderColor:'#fb923c'}]}, options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'bottom'}}}});
 }
 
-function updateCharts(history){
+/* Merge: take backend history arrays and append current live means as an extra point */
+function mergeHistoryWithLive(history, live) {
+  if(!history) return null;
+  // copy arrays
+  const iters = history.iterations.slice();
+  const base = history.baseline_mean.slice();
+  const up = history.up_mean.slice();
+  const down = history.down_mean.slice();
+  const upThr = history.upload_mbps.slice();
+  const downThr = history.download_mbps.slice();
+
+  // If there's live samples for current iteration, append a synthetic point using means
+  if(live) {
+    // only append if iteration matches next index or replace last point if same iteration
+    const liveIter = live.iteration;
+    if(liveIter !== undefined && liveIter !== null) {
+      const liveBaseMean = (live.baseline && live.baseline.length) ? (live.baseline.reduce((a,b)=>a+b,0)/live.baseline.length) : null;
+      const liveUpMean = (live.upload && live.upload.length) ? (live.upload.reduce((a,b)=>a+b,0)/live.upload.length) : null;
+      const liveDownMean = (live.download && live.download.length) ? (live.download.reduce((a,b)=>a+b,0)/live.download.length) : null;
+      const nextLabel = '#' + liveIter;
+      // if last iteration number equals liveIter, replace last values, else push
+      if(iters.length && iters[iters.length-1] === liveIter) {
+        base[base.length-1] = liveBaseMean;
+        up[up.length-1] = liveUpMean;
+        down[down.length-1] = liveDownMean;
+      } else {
+        iters.push(liveIter);
+        base.push(liveBaseMean);
+        up.push(liveUpMean);
+        down.push(liveDownMean);
+        upThr.push(null);
+        downThr.push(null);
+      }
+    }
+  }
+
+  return {
+    iterations: iters,
+    baseline_mean: base,
+    up_mean: up,
+    down_mean: down,
+    upload_mbps: upThr,
+    download_mbps: downThr
+  };
+}
+
+function updateCharts(history) {
   createCharts();
-  if(!history){ for(let k in charts){ charts[k].data.labels=[]; charts[k].data.datasets.forEach(ds=>ds.data=[]); charts[k].update(); } return; }
-  const labels = history.iterations.map(i=>'#'+i);
-  charts.baseline.data.labels = labels; charts.baseline.data.datasets[0].data = history.baseline_mean.map(v=>v===null?NaN:v); charts.baseline.update();
-  charts.rtt.data.labels = labels; charts.rtt.data.datasets[0].data = history.up_mean.map(v=>v===null?NaN:v); charts.rtt.data.datasets[1].data = history.down_mean.map(v=>v===null?NaN:v); charts.rtt.update();
-  charts.thr.data.labels = labels; charts.thr.data.datasets[0].data = history.upload_mbps.map(v=>v===null?NaN:v); charts.thr.data.datasets[1].data = history.download_mbps.map(v=>v===null?NaN:v); charts.thr.update();
+  if(!history) {
+    for(let k in charts) {
+      charts[k].data.labels = [];
+      charts[k].data.datasets.forEach(ds => ds.data = []);
+      charts[k].update();
+    }
+    return;
+  }
+  const labels = history.iterations.map(i => '#'+i);
+  charts.baseline.data.labels = labels;
+  charts.baseline.data.datasets[0].data = history.baseline_mean.map(v => v === null ? NaN : v);
+  charts.baseline.update();
+
+  charts.rtt.data.labels = labels;
+  charts.rtt.data.datasets[0].data = history.up_mean.map(v => v === null ? NaN : v);
+  charts.rtt.data.datasets[1].data = history.down_mean.map(v => v === null ? NaN : v);
+  charts.rtt.update();
+
+  charts.thr.data.labels = labels;
+  charts.thr.data.datasets[0].data = history.upload_mbps.map(v => v === null ? NaN : v);
+  charts.thr.data.datasets[1].data = history.download_mbps.map(v => v === null ? NaN : v);
+  charts.thr.update();
 }
 
 function setSummary(locSummary, loc){
@@ -258,30 +338,58 @@ function setSummary(locSummary, loc){
 }
 
 async function updateStatus(){
-  try{
+  try {
     const res = await fetch('/status');
     const data = await res.json();
     $('statusPill').innerText = data.running ? ('▶ ' + (data.current_location||'') + ' · iter ' + (data.current_iteration||0)) : 'idle';
     $('lastMsg').innerText = data.last_message || '(esperando...)';
     const logs = data.logs || [];
     if(logs.length===0) $('logbox').innerText = '(no hay logs todavía)';
-    else { let txt=''; logs.slice(-6).reverse().forEach(it=>{ txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`; txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`; }); $('logbox').innerText = txt; }
+    else {
+      let txt = '';
+      logs.slice(-6).reverse().forEach(it=> {
+        txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
+        txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
+      });
+      $('logbox').innerText = txt;
+    }
+
+    // determine which location to show
     const userSel = document.getElementById('locList').querySelector('.loc-btn.active');
     let viewLoc = userSel ? userSel.dataset.loc : data.current_location;
     if(!viewLoc){ const keys = Object.keys(data.summary || {}); if(keys.length) viewLoc = keys[keys.length-1]; }
+
     const locSummary = (data.summary||{})[viewLoc] || data.current_location_summary || null;
-    setSummary(locSummary, viewLoc);
-    let history = data.current_location_history || null;
-    if(!history && viewLoc){
+
+    // merge history with live samples if current location matches viewLoc
+    let history = null;
+    if(data.current_location_history && data.current_location === viewLoc) {
+      // include live from data.live if present
+      const live = data.live || null;
+      history = mergeHistoryWithLive(data.current_location_history, live);
+    } else {
+      // try build from logs
       const items = (data.logs || []).filter(it => it.location === viewLoc);
       if(items.length){
-        history = { iterations: items.map(it=>it.iteration), baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null), up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null), down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null), upload_mbps: items.map(it => it.upload_mbps ?? null), download_mbps: items.map(it => it.download_mbps ?? null) };
+        history = {
+          iterations: items.map(it=>it.iteration),
+          baseline_mean: items.map(it => (it.ping_stats_baseline||{}).mean_ms ?? null),
+          up_mean: items.map(it => (it.ping_stats_upload||{}).mean_ms ?? null),
+          down_mean: items.map(it => (it.ping_stats_download||{}).mean_ms ?? null),
+          upload_mbps: items.map(it => it.upload_mbps ?? null),
+          download_mbps: items.map(it => it.download_mbps ?? null)
+        };
       }
     }
+
+    setSummary(locSummary, viewLoc);
     updateCharts(history);
-  }catch(e){ console.error('updateStatus failed', e); }
+  } catch (e) {
+    console.error('updateStatus failed', e);
+  }
 }
 
+/* UI actions */
 $('startBtn').addEventListener('click', async ()=>{
   const form = new FormData();
   form.append('server', $('serverInput').value);
@@ -306,7 +414,8 @@ $('nextLoc').addEventListener('click', ()=>{ const btns = Array.from(document.qu
 
 function selectLocation(l){ setActiveLocButton(l); updateStatus(); }
 
-window.addEventListener('load', ()=>{ initLocButtons(); setActiveLocButton(LOCS[0]||''); createCharts(); updateStatus(); setInterval(updateStatus, 1500); window.addEventListener('orientationchange', ()=> { for(let k in charts) charts[k]?.resize(); }); });
+/* Init */
+window.addEventListener('load', ()=>{ initLocButtons(); setActiveLocButton(LOCS[0]||''); createCharts(); updateStatus(); /* faster polling for more live feeling */ setInterval(updateStatus, 700); window.addEventListener('orientationchange', ()=> { for(let k in charts) charts[k]?.resize(); }); });
 </script>
 </body>
 </html>
@@ -315,7 +424,7 @@ window.addEventListener('load', ()=>{ initLocButtons(); setActiveLocButton(LOCS[
 # Safely replace marker with JSON list of locations
 INDEX_HTML = INDEX_HTML.replace('@@LOCATIONS@@', json.dumps(LOCATIONS))
 
-# ---------- Backend functions (measurement logic) ----------
+# ---------- Backend utility functions ----------
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
@@ -355,46 +464,37 @@ def get_rssi():
         return None
     return None
 
-def run_ping_collect(host, duration_s=60, interval=0.2):
+def run_ping_collect(host, duration_s=60, interval=0.2, append_to=None):
     """
     Robust ping collector that uses the system 'ping' binary (the same used by console).
-    - Does NOT force -4 or a specific path; it searches shutil.which('ping') first.
     - Attempts to use '-w' (deadline) and falls back to '-c' (count) if needed.
-    - Captures stdout/stderr for diagnostics and logs a snippet if no RTTs parsed.
+    - If 'append_to' is provided (a list), each parsed RTT is appended to it in real-time.
+    - Returns the list of RTTs parsed (also appended_to if given).
     """
     import shutil
 
     rtts = []
-    # Find system 'ping' (as used from console)
-    ping_exe = shutil.which('ping')
-    # fallback common paths
-    candidates = [ping_exe, '/data/data/com.termux/files/usr/bin/ping', '/system/bin/ping', '/usr/bin/ping', '/bin/ping']
-    ping_path = None
-    for p in candidates:
-        if not p:
-            continue
-        try:
+    ping_exe = shutil.which('ping') or '/data/data/com.termux/files/usr/bin/ping'
+    # use ping_exe if available and executable
+    if not (ping_exe and os.path.isfile(ping_exe) and os.access(ping_exe, os.X_OK)):
+        # search common locations
+        for p in ['/system/bin/ping', '/usr/bin/ping', '/bin/ping']:
             if os.path.isfile(p) and os.access(p, os.X_OK):
-                ping_path = p
+                ping_exe = p
                 break
-        except Exception:
-            continue
-    if not ping_path:
-        log(f"run_ping_collect: no se encontró 'ping' en PATH ni en rutas comunes. candidates={candidates}")
+    if not ping_exe or not os.path.isfile(ping_exe):
+        log(f"run_ping_collect: 'ping' no encontrado. ping_exe={ping_exe}")
         return rtts
 
-    # Try using -w first (deadline)
-    cmd = [ping_path, '-i', str(interval), '-w', str(int(duration_s)), host]
-    use_count = False
+    # Try using -w deadline
+    cmd = [ping_exe, '-i', str(interval), '-w', str(int(duration_s)), host]
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except Exception as e:
+    except Exception:
         # fallback to -c
-        use_count = True
-
-    if use_count:
         count = max(2, int(duration_s / interval))
-        cmd = [ping_path, '-i', str(interval), '-c', str(count), host]
+        cmd = [ping_exe, '-i', str(interval), '-c', str(count), host]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except Exception as e:
@@ -417,6 +517,11 @@ def run_ping_collect(host, duration_s=60, interval=0.2):
                         parts = token.split()
                         rtt = float(parts[0])
                         rtts.append(rtt)
+                        if append_to is not None:
+                            try:
+                                append_to.append(rtt)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
             else:
@@ -428,7 +533,7 @@ def run_ping_collect(host, duration_s=60, interval=0.2):
                     except:
                         pass
                     break
-                time.sleep(0.05)
+                time.sleep(0.03)
         try:
             se = proc.stderr.read()
             if se:
@@ -613,14 +718,23 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                     time.sleep(1)
                 with state_lock:
                     state['current_iteration'] = it
+                    # reset live buffers for this iteration
+                    state['live']['location'] = loc
+                    state['live']['iteration'] = it
+                    state['live']['baseline'] = []
+                    state['live']['upload'] = []
+                    state['live']['download'] = []
+
                 timestamp = datetime.utcnow().isoformat() + 'Z'
                 rssi = get_rssi()
                 log(f"[{loc}][iter {it}] RSSI: {rssi}")
 
-                # baseline
+                # --- BASELINE PHASE ---
                 ping_baseline_results = []
-                log(f"[{loc}][iter {it}] Running baseline ping for {baseline_s}s (no load)")
-                ping_baseline_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=baseline_s, interval=ping_interval)), args=(ping_baseline_results,))
+                # append_to is state's live baseline list (so /status can read it)
+                with state_lock:
+                    append_baseline = state['live']['baseline']
+                ping_baseline_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=baseline_s, interval=ping_interval, append_to=append_baseline)), args=(ping_baseline_results,))
                 ping_baseline_thread.start()
                 ping_baseline_thread.join(timeout=baseline_s + 3)
                 if ping_baseline_thread.is_alive():
@@ -628,13 +742,17 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                         ping_baseline_thread.join(timeout=1)
                     except:
                         pass
-                ping_baseline = ping_baseline_results if isinstance(ping_baseline_results, list) else []
-                ping_stats_baseline = compute_ping_stats(ping_baseline)
+                # copy final baseline from live list (thread appended into state['live']['baseline'])
+                with state_lock:
+                    final_baseline = list(state['live']['baseline'])
+                ping_stats_baseline = compute_ping_stats(final_baseline)
                 log(f"[{loc}][iter {it}] baseline ping count={ping_stats_baseline.get('count',0)} mean={ping_stats_baseline.get('mean_ms')}ms jitter_rfc={ping_stats_baseline.get('jitter_rfc3550_ms')}ms")
 
-                # upload phase
+                # --- UPLOAD PHASE ---
+                with state_lock:
+                    append_upload = state['live']['upload']
                 ping_up_results = []
-                ping_up_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=up_dur, interval=ping_interval)), args=(ping_up_results,))
+                ping_up_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=up_dur, interval=ping_interval, append_to=append_upload)), args=(ping_up_results,))
                 ping_up_thread.start()
                 log(f"[{loc}][iter {it}] iperf3 upload for {up_dur}s (ping upload running concurrently)")
                 iperf_up = run_iperf3(server, duration=up_dur, reverse=False)
@@ -642,10 +760,14 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 log(f"[{loc}][iter {it}] upload Mbps: {upload_mbps}")
                 if ping_up_thread.is_alive():
                     ping_up_thread.join(timeout=3)
+                with state_lock:
+                    final_upload = list(state['live']['upload'])
 
-                # download phase
+                # --- DOWNLOAD PHASE ---
+                with state_lock:
+                    append_download = state['live']['download']
                 ping_down_results = []
-                ping_down_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=down_dur, interval=ping_interval)), args=(ping_down_results,))
+                ping_down_thread = threading.Thread(target=lambda lst: lst.extend(run_ping_collect(server, duration_s=down_dur, interval=ping_interval, append_to=append_download)), args=(ping_down_results,))
                 ping_down_thread.start()
                 log(f"[{loc}][iter {it}] iperf3 download (-R) for {down_dur}s (ping download running concurrently)")
                 iperf_down = run_iperf3(server, duration=down_dur, reverse=True)
@@ -653,11 +775,12 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 log(f"[{loc}][iter {it}] download Mbps: {download_mbps}")
                 if ping_down_thread.is_alive():
                     ping_down_thread.join(timeout=3)
+                with state_lock:
+                    final_download = list(state['live']['download'])
 
-                rtts_up = ping_up_results if isinstance(ping_up_results, list) else []
-                rtts_down = ping_down_results if isinstance(ping_down_results, list) else []
-                ping_stats_up = compute_ping_stats(rtts_up)
-                ping_stats_down = compute_ping_stats(rtts_down)
+                # Compute ping stats per phase
+                ping_stats_up = compute_ping_stats(final_upload)
+                ping_stats_down = compute_ping_stats(final_download)
                 log(f"[{loc}][iter {it}] ping(up) count={ping_stats_up.get('count',0)} mean={ping_stats_up.get('mean_ms')}ms jitter_rfc={ping_stats_up.get('jitter_rfc3550_ms')}ms")
                 log(f"[{loc}][iter {it}] ping(down) count={ping_stats_down.get('count',0)} mean={ping_stats_down.get('mean_ms')}ms jitter_rfc={ping_stats_down.get('jitter_rfc3550_ms')}ms")
 
@@ -669,11 +792,11 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                     "baseline_seconds": baseline_s,
                     "upload_seconds": up_dur,
                     "download_seconds": down_dur,
-                    "ping_samples_baseline_ms": ping_baseline,
+                    "ping_samples_baseline_ms": final_baseline,
                     "ping_stats_baseline": ping_stats_baseline,
-                    "ping_samples_upload_ms": rtts_up,
+                    "ping_samples_upload_ms": final_upload,
                     "ping_stats_upload": ping_stats_up,
-                    "ping_samples_download_ms": rtts_down,
+                    "ping_samples_download_ms": final_download,
                     "ping_stats_download": ping_stats_down,
                     "upload_mbps": upload_mbps,
                     "download_mbps": download_mbps,
@@ -682,7 +805,12 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
                 }
                 with state_lock:
                     state['logs'].append(entry)
+                    # clear live lists for next iteration; keep location/iteration until next set
+                    state['live']['baseline'] = []
+                    state['live']['upload'] = []
+                    state['live']['download'] = []
 
+            # compute aggregates for location and expose them to UI
             with state_lock:
                 state['summary'][loc] = compute_aggregates_for_location(loc)
             log(f"Finished location {loc}. aggregates updated.")
@@ -703,9 +831,14 @@ def runner_thread(server, iters_per_loc, duration_total, ping_interval=0.2, base
             state['stop_requested'] = False
             state['current_location_idx'] = 0
             state['current_iteration'] = 0
+            # clear live
+            state['live']['location'] = None
+            state['live']['iteration'] = None
+            state['live']['baseline'] = []
+            state['live']['upload'] = []
+            state['live']['download'] = []
 
-# Flask routes (clear_all, clear_location, status, start, pause, resume, stop, download) unchanged
-# Reuse handlers from earlier in file (they are defined below)
+# ---------- Flask routes ----------
 
 @APP.route('/')
 def index():
@@ -795,27 +928,36 @@ def clear_location():
 
 @APP.route('/status', methods=['GET'])
 def status():
-    cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
-    current_summary = state['summary'].get(cur_loc) if cur_loc else None
-    history = None
-    if cur_loc:
-        items = [x for x in state['logs'] if x['location'] == cur_loc]
-        if items:
-            iterations = [it.get('iteration') for it in items]
-            baseline_mean = [it.get('ping_stats_baseline', {}).get('mean_ms') for it in items]
-            up_mean = [it.get('ping_stats_upload', {}).get('mean_ms') for it in items]
-            down_mean = [it.get('ping_stats_download', {}).get('mean_ms') for it in items]
-            upload_mbps = [it.get('upload_mbps') for it in items]
-            download_mbps = [it.get('download_mbps') for it in items]
-            history = {
-                "iterations": iterations,
-                "baseline_mean": baseline_mean,
-                "up_mean": up_mean,
-                "down_mean": down_mean,
-                "upload_mbps": upload_mbps,
-                "download_mbps": download_mbps
-            }
     with state_lock:
+        cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
+        current_summary = state['summary'].get(cur_loc) if cur_loc else None
+        # history for charts (current location)
+        history = None
+        if cur_loc:
+            items = [x for x in state['logs'] if x['location'] == cur_loc]
+            if items:
+                iterations = [it.get('iteration') for it in items]
+                baseline_mean = [it.get('ping_stats_baseline', {}).get('mean_ms') for it in items]
+                up_mean = [it.get('ping_stats_upload', {}).get('mean_ms') for it in items]
+                down_mean = [it.get('ping_stats_download', {}).get('mean_ms') for it in items]
+                upload_mbps = [it.get('upload_mbps') for it in items]
+                download_mbps = [it.get('download_mbps') for it in items]
+                history = {
+                    "iterations": iterations,
+                    "baseline_mean": baseline_mean,
+                    "up_mean": up_mean,
+                    "down_mean": down_mean,
+                    "upload_mbps": upload_mbps,
+                    "download_mbps": download_mbps
+                }
+        # Include live samples (truncate lists to last 200 samples to avoid big payload)
+        live_copy = {
+            "location": state['live'].get('location'),
+            "iteration": state['live'].get('iteration'),
+            "baseline": state['live'].get('baseline', [])[-200:],
+            "upload": state['live'].get('upload', [])[-200:],
+            "download": state['live'].get('download', [])[-200:]
+        }
         cfg = state.get('config', {})
         last_msg = state.get('last_message', '')
         logs_slice = state['logs'][-30:]
@@ -830,23 +972,27 @@ def status():
         "summary": summ,
         "current_location_summary": current_summary,
         "current_location_history": history,
+        "live": live_copy,
         "config": cfg
     })
 
 @APP.route('/download/json')
 def download_json():
-    if not state['logs']:
-        return jsonify({"error":"no logs yet"}), 400
-    fn = f"termux_network_test_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
-    with open(fn, 'w', encoding='utf-8') as f:
+    with state_lock:
+        if not state['logs']:
+            return jsonify({"error":"no logs yet"}), 400
+        fn = f"termux_network_test_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
         out = {"generated_at": datetime.utcnow().isoformat()+'Z', "config": state.get('config',{}), "logs": state['logs'], "summary": state.get('summary',{})}
+    with open(fn, 'w', encoding='utf-8') as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     return send_file(fn, as_attachment=True)
 
 @APP.route('/download/csv')
 def download_csv():
-    if not state['logs']:
-        return jsonify({"error":"no logs yet"}), 400
+    with state_lock:
+        if not state['logs']:
+            return jsonify({"error":"no logs yet"}), 400
+        logs_copy = list(state['logs'])
     fn = f"termux_network_test_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
     fieldnames = [
         "timestamp","location","iteration","rssi",
@@ -858,7 +1004,7 @@ def download_csv():
     with open(fn, 'w', newline='', encoding='utf-8') as csvfile:
         w = csv.DictWriter(csvfile, fieldnames=fieldnames)
         w.writeheader()
-        for it in state['logs']:
+        for it in logs_copy:
             ps_base = it.get('ping_stats_baseline', {})
             js_base = ps_base.get('jitter_simple', {})
             ps_up = it.get('ping_stats_upload', {})
@@ -896,9 +1042,10 @@ def download_csv():
             })
     return send_file(fn, as_attachment=True)
 
+# ---------- Run app ----------
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Termux network tester — mobile UI')
+    parser = argparse.ArgumentParser(description='Termux network tester — mobile UI live charts')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', default=5000, type=int)
     args = parser.parse_args()
