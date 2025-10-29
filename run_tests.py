@@ -2,9 +2,20 @@
 """
 run_tests.py
 
-Versión con UI mejorada y adaptada a mobile.
-Mantiene la funcionalidad: baseline + ping por fase (upload/download), iperf3 TCP,
-recolección RSSI (termux-api), logs, export JSON/CSV, pausa/reanudar/stop, resumen por ubicación.
+Termux network tester with mobile-friendly UI and small inline charts.
+
+Features:
+- Baseline ping (short, no load) + ping during upload + ping during download
+- iperf3 TCP upload and download (split duration)
+- RSSI via termux-api
+- Logs per iteration and summary per location
+- Exports JSON & CSV
+- Mobile-optimized UI with small charts (Chart.js via CDN) showing:
+    - Baseline RTT trend
+    - RTT (upload vs download) trend
+    - Throughput (upload vs download) trend
+- UI controls: start / pause / resume / stop, auto-advance, progress bar, recent logs
+- Summary card with small charts and stats (mean/median/p95)
 """
 import os
 import subprocess
@@ -92,7 +103,15 @@ INDEX_HTML = """
   /* small table for details */
   table.small { width:100%; border-collapse:collapse; margin-top:8px; }
   table.small th, table.small td { text-align:left; padding:6px; border-bottom:1px solid #f1f5f9; font-size:0.9rem; }
+
+  /* chart containers */
+  .chart-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  .chart-box { flex:1 1 48%; min-width:160px; background:#fbfdff; padding:8px; border-radius:8px; border:1px solid #eef5ff; }
+  .chart-box canvas { width:100% !important; height:80px !important; }
 </style>
+
+<!-- Chart.js CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 <div class="app">
@@ -100,7 +119,7 @@ INDEX_HTML = """
     <div class="logo">TN</div>
     <div>
       <h1>Termux Network Tester</h1>
-      <p class="lead">Baseline + ping por fase • p1..p8 • mobile-friendly</p>
+      <p class="lead">Baseline + ping por fase • p1..p8 • mobile-friendly • gráficas</p>
     </div>
   </header>
 
@@ -144,21 +163,22 @@ INDEX_HTML = """
         <strong>Resumen de ubicación</strong>
         <small class="muted" id="summaryLoc">—</small>
       </div>
+
       <div class="summary-cards" id="summaryCards">
         <div class="s-card">
-          <h4>Ping baseline (mean)</h4>
+          <h4>Ping baseline (mean / median / p95)</h4>
           <div class="s-val" id="sb_baseline">—</div>
-          <div class="muted">mean / median / p95</div>
+          <div class="muted">media / mediana / p95</div>
         </div>
         <div class="s-card">
-          <h4>Ping upload (mean)</h4>
+          <h4>Ping upload (mean / median / p95)</h4>
           <div class="s-val" id="sb_up">—</div>
-          <div class="muted">mean / median / p95</div>
+          <div class="muted">media / mediana / p95</div>
         </div>
         <div class="s-card">
-          <h4>Ping download (mean)</h4>
+          <h4>Ping download (mean / median / p95)</h4>
           <div class="s-val" id="sb_down">—</div>
-          <div class="muted">mean / median / p95</div>
+          <div class="muted">media / mediana / p95</div>
         </div>
         <div class="s-card">
           <h4>Throughput (Mbps)</h4>
@@ -166,6 +186,27 @@ INDEX_HTML = """
           <div class="muted">upload / download (mean)</div>
         </div>
       </div>
+
+      <!-- Small charts -->
+      <div class="chart-row">
+        <div class="chart-box">
+          <div class="muted">Baseline RTT (ms)</div>
+          <canvas id="chartBaseline"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="muted">RTT: upload vs download (ms)</div>
+          <canvas id="chartRTT"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="muted">Throughput (Mbps)</div>
+          <canvas id="chartThroughput"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="muted">Últimos logs (resumen)</div>
+          <div id="miniLog" style="font-family:monospace; font-size:0.8rem; color:#0f172a; margin-top:6px;"></div>
+        </div>
+      </div>
+
       <div id="summaryTable" style="margin-top:8px;"></div>
     </section>
 
@@ -180,7 +221,47 @@ INDEX_HTML = """
 </div>
 
 <script>
-const toFixed = (v, d=3) => (v===undefined || v===null) ? '—' : (Math.round(v*Math.pow(10,d))/Math.pow(10,d));
+/* Chart helpers */
+let charts = { baseline:null, rtt:null, thr:null };
+
+function createChartBaseline(ctx) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{ label:'baseline mean', data: [], borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,0.12)', tension:0.3, pointRadius:0 }]
+    },
+    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{display:true, ticks:{maxTicksLimit:4}}} }
+  });
+}
+function createChartRTT(ctx) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label:'upload', data: [], borderColor:'#10b981', backgroundColor:'rgba(16,185,129,0.06)', tension:0.3, pointRadius:0 },
+        { label:'download', data: [], borderColor:'#fb7185', backgroundColor:'rgba(251,113,133,0.06)', tension:0.3, pointRadius:0 }
+      ]
+    },
+    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:true, position:'bottom'}}, scales:{x:{display:false}, y:{display:true, ticks:{maxTicksLimit:4}}} }
+  });
+}
+function createChartThr(ctx) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label:'upload Mbps', data: [], borderColor:'#7c3aed', backgroundColor:'rgba(124,58,237,0.06)', tension:0.3, pointRadius:0 },
+        { label:'download Mbps', data: [], borderColor:'#ea580c', backgroundColor:'rgba(234,88,12,0.06)', tension:0.3, pointRadius:0 }
+      ]
+    },
+    options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:true, position:'bottom'}}, scales:{x:{display:false}, y:{display:true, ticks:{maxTicksLimit:4}}} }
+  });
+}
+
+/* UI interactions */
 const el = id => document.getElementById(id);
 
 document.getElementById('startForm').addEventListener('submit', function(e){
@@ -218,25 +299,54 @@ function updateProgress(pct){
   el('progressBar').style.width = pct + '%';
 }
 
+/* Update and render charts */
+function ensureCharts() {
+  if(!charts.baseline) charts.baseline = createChartBaseline(el('chartBaseline').getContext('2d'));
+  if(!charts.rtt) charts.rtt = createChartRTT(el('chartRTT').getContext('2d'));
+  if(!charts.thr) charts.thr = createChartThr(el('chartThroughput').getContext('2d'));
+}
+function setChartDataFromHistory(history) {
+  ensureCharts();
+  const labels = history.iterations.map(i=>`#${i}`);
+  // baseline
+  charts.baseline.data.labels = labels;
+  charts.baseline.data.datasets[0].data = history.baseline_mean;
+  charts.baseline.update();
+
+  // RTT upload/download
+  charts.rtt.data.labels = labels;
+  charts.rtt.data.datasets[0].data = history.up_mean;
+  charts.rtt.data.datasets[1].data = history.down_mean;
+  charts.rtt.update();
+
+  // throughput
+  charts.thr.data.labels = labels;
+  charts.thr.data.datasets[0].data = history.upload_mbps;
+  charts.thr.data.datasets[1].data = history.download_mbps;
+  charts.thr.update();
+}
+
 function updateStatus(){
   fetch('/status').then(r=>r.json()).then(j=>{
     const running = j.running;
     const curLoc = j.current_location || '';
     el('statusPill').innerText = running ? `▶ ${curLoc} · iter ${j.current_iteration}` : 'idle';
     el('lastMsg').innerText = j.last_message || '';
-    // logs
     const logs = j.logs || [];
     if(logs.length===0) {
       el('logbox').innerText = '(no hay logs)';
+      el('miniLog').innerText = '';
     } else {
       const last = logs.slice(-6).reverse();
       let txt = '';
       last.forEach(it => {
         txt += `[${it.location} i${it.iteration}] up:${it.upload_mbps||'—'} Mbps dn:${it.download_mbps||'—'} rssi:${it.rssi||'—'}\\n`;
-        txt += `  baseline mean:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up mean:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn mean:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
+        txt += `  base:${(it.ping_stats_baseline||{}).mean_ms||'—'}ms up:${(it.ping_stats_upload||{}).mean_ms||'—'}ms dn:${(it.ping_stats_download||{}).mean_ms||'—'}ms\\n\\n`;
       });
       el('logbox').innerText = txt;
+      el('miniLog').innerText = txt.split('\\n').slice(0,6).join('\\n');
     }
+
     // summary for current or last
     let locSummary = null;
     if (j.summary && curLoc && j.summary[curLoc]) locSummary = j.summary[curLoc];
@@ -245,7 +355,7 @@ function updateStatus(){
       if(keys.length>0) locSummary = j.summary[keys[keys.length-1]];
     }
     el('summaryLoc').innerText = (curLoc || (locSummary ? Object.keys(j.summary).slice(-1)[0] : '—')) ;
-    // set cards
+
     const base = (locSummary && locSummary.ping_baseline_mean_stats) || {};
     const up = (locSummary && locSummary.ping_upload_mean_stats) || {};
     const down = (locSummary && locSummary.ping_download_mean_stats) || {};
@@ -256,7 +366,15 @@ function updateStatus(){
     el('sb_down').innerText = (down.mean!==undefined) ? `${down.mean} / ${down.median} / ${down.p95}` : '—';
     el('sb_thr').innerText = ((upThr.mean!==undefined) || (downThr.mean!==undefined)) ? `${upThr.mean||'—'} / ${downThr.mean||'—'}` : '—';
     el('summaryTable').innerHTML = buildSmallTable(locSummary);
-    // simple progress: if running, show progress based on current_iteration vs total (if config exists)
+
+    // history arrays for charts (from backend)
+    const history = j.current_location_history || null;
+    if(history) {
+      // history: { iterations:[], baseline_mean:[], up_mean:[], down_mean:[], upload_mbps:[], download_mbps:[] }
+      setChartDataFromHistory(history);
+    }
+
+    // progress bar simple
     if (j.config && j.config.iters_per_loc) {
       const iters = j.config.iters_per_loc;
       const idx = j.current_location ? (['p1','p2','p3','p4','p5','p6','p7','p8'].indexOf(j.current_location) + 1) : 0;
@@ -277,7 +395,8 @@ updateStatus();
 </html>
 """
 
-# --- backend logic (same as previous, unchanged) ---
+# --- backend logic (unchanged functionality) ---
+# NOTE: /status now also returns 'current_location_history' for plotting
 
 def log(msg):
     ts = datetime.utcnow().isoformat() + 'Z'
@@ -317,6 +436,7 @@ def get_rssi():
     return None
 
 def run_ping_collect(host, duration_s=60, interval=0.2):
+    """Run ping and collect RTT samples in ms. interval in seconds (e.g., 0.2)."""
     rtts = []
     cmd = ['ping', '-i', str(interval), '-w', str(int(duration_s)), host]
     try:
@@ -669,6 +789,28 @@ def stop():
 def status():
     cur_loc = LOCATIONS[state['current_location_idx']] if 0 <= state['current_location_idx'] < len(LOCATIONS) else None
     current_summary = state['summary'].get(cur_loc) if cur_loc else None
+
+    # Build history arrays for current location (for charts)
+    history = None
+    if cur_loc:
+        items = [x for x in state['logs'] if x['location'] == cur_loc]
+        if items:
+            iterations = [it.get('iteration') for it in items]
+            baseline_mean = [it.get('ping_stats_baseline', {}).get('mean_ms') for it in items]
+            up_mean = [it.get('ping_stats_upload', {}).get('mean_ms') for it in items]
+            down_mean = [it.get('ping_stats_download', {}).get('mean_ms') for it in items]
+            upload_mbps = [it.get('upload_mbps') for it in items]
+            download_mbps = [it.get('download_mbps') for it in items]
+            # sanitize: replace None with nulls preserved for JS
+            history = {
+                "iterations": iterations,
+                "baseline_mean": baseline_mean,
+                "up_mean": up_mean,
+                "down_mean": down_mean,
+                "upload_mbps": upload_mbps,
+                "download_mbps": download_mbps
+            }
+
     return jsonify({
         "running": state['running'],
         "paused": state['paused'],
@@ -678,6 +820,7 @@ def status():
         "logs": state['logs'][-30:],
         "summary": state['summary'],
         "current_location_summary": current_summary,
+        "current_location_history": history,
         "config": state.get('config', {})
     })
 
@@ -754,7 +897,7 @@ def download_csv():
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Termux network tester (mobile UI)')
+    parser = argparse.ArgumentParser(description='Termux network tester (mobile UI with charts)')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', default=5000, type=int)
     args = parser.parse_args()
